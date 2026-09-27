@@ -577,5 +577,16 @@ message OIDCSession {
   string refresh_token = 4;
 }
 
+// ============================================================================
+// Node diagnostics API
+// ============================================================================
+//
+// Read-only operator diagnostics served by the node sidecar. These addresses
+// are what the node listens on and announces to other peers; they are not the
+// external addresses that remote peers report observing through Identify.
 
+message NetworkInfoResponse {
+  repeated string listen_addresses = 1;
+  repeated string announced_addresses = 2;
+}
 

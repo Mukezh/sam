@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"github.com/google/sam/api"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // connectPeerWithToken dials POST /debug/connect-peer, the REST endpoint that
@@ -167,12 +168,22 @@ roles: []
 
 	t.Run("network-info", func(t *testing.T) {
 		resp := debugGet(t, actualApiAddrA, "/debug/network-info")
-		var info map[string]any
-		if err := json.Unmarshal([]byte(resp), &info); err != nil {
+		if !strings.Contains(resp, `"announced_addresses"`) {
+			t.Fatalf("network info response does not contain announced_addresses: %s", resp)
+		}
+		if strings.Contains(resp, `"observed_addresses"`) {
+			t.Fatalf("network info response still contains observed_addresses: %s", resp)
+		}
+
+		var info api.NetworkInfoResponse
+		if err := protojson.Unmarshal([]byte(resp), &info); err != nil {
 			t.Fatalf("failed to unmarshal JSON: %v", err)
 		}
-		if addresses, ok := info["listen_addresses"].([]any); !ok || len(addresses) == 0 {
-			t.Errorf("expected listen_addresses array, got %v", info)
+		if len(info.ListenAddresses) == 0 {
+			t.Errorf("expected listen_addresses array, got %v", info.ListenAddresses)
+		}
+		if len(info.AnnouncedAddresses) == 0 {
+			t.Errorf("expected announced_addresses array, got %v", info.AnnouncedAddresses)
 		}
 	})
 
