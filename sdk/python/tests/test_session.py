@@ -21,13 +21,17 @@ import time
 import urllib.parse
 
 import biscuit_auth as ba
+import httpx
 import multiaddr
 import pytest
 import trio
+import trio.testing
 from libp2p import new_host
 from libp2p.crypto.ed25519 import create_new_key_pair
 from libp2p.custom_types import TProtocol
+from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import info_from_p2p_addr
+from libp2p.peer.peerstore import PeerStore
 from libp2p.security.tls.transport import PROTOCOL_ID as TLS_PROTOCOL_ID
 from libp2p.security.tls.transport import TLSTransport
 from libp2p.stream_muxer.yamux.yamux import PROTOCOL_ID as YAMUX_PROTOCOL_ID
@@ -37,11 +41,17 @@ from libp2p.utils.varint import encode_varint_prefixed, read_varint_prefixed_byt
 from agent_mesh._proto import circuit_pb2 as circuit
 from agent_mesh._proto import sam_pb2 as pb
 from agent_mesh.auth import AUTH_PROTOCOL, auth_stream_handler, authenticate_with_peer
-from agent_mesh.biscuit import ROLE_ROUTER
+from agent_mesh.authorizer import ProviderAuthorizerOptions
+from agent_mesh.biscuit import ROLE_ROUTER, BiscuitVerificationError
 from agent_mesh.controlplane import ROLE_NODE
+from agent_mesh.discovery import DiscoveredProvider
+from agent_mesh.httpx_transport import MeshTransport
 from agent_mesh.identity import Identity
+from agent_mesh.libp2p_http import HTTP_PROTOCOL, A2AEndpoint, HTTPResponse, ProviderOptions, http_ingress_handler
+from agent_mesh.mcp_client import LabelsNotSatisfiedError
 from agent_mesh.mesh import AgentMesh
 from agent_mesh.relay import HOP_PROTOCOL as RELAY_HOP_PROTOCOL
+from agent_mesh.session import AdmittedRouter, MeshSession
 from google.protobuf.timestamp_pb2 import Timestamp
 
 
@@ -56,18 +66,36 @@ def _ts_s(seconds: int) -> Timestamp:
     t.FromSeconds(int(seconds))
     return t
 
-CP = ba.KeyPair()
+# The control plane's signing key, as an Identity so a test can sign /keys
+# with it and as the biscuit key pair that mints credentials.
+CP_IDENTITY = Identity.generate()
+CP = ba.KeyPair.from_private_key(ba.PrivateKey.from_bytes(CP_IDENTITY.seed, ba.Algorithm.Ed25519))
 CP_KEY = CP.public_key.to_bytes()
 
 
-def mint(peer_id: str, role: str, expiration: str = "2035-01-01T00:00:00Z") -> bytes:
-    return ba.BiscuitBuilder(
-        "node({p}); expiration(" + expiration + "); role({r});", {"p": peer_id, "r": role}
-    ).build(CP.private_key).to_bytes()
+def mint(peer_id: str, role: str, expiration: str = "2035-01-01T00:00:00Z", labels: dict[str, str] | None = None, signer: ba.KeyPair = CP) -> bytes:
+    code = "node({p}); client_peer_id({p}); expiration(" + expiration + "); role({r});"
+    params = {"p": peer_id, "r": role}
+    for i, (k, v) in enumerate((labels or {}).items()):
+        code += f" label({{k{i}}}, {{v{i}}});"
+        params[f"k{i}"] = k
+        params[f"v{i}"] = v
+    return ba.BiscuitBuilder(code, params).build(signer.private_key).to_bytes()
+
+
+# What the control plane renders for a policy granting the node role every
+# A2A service on any target, and nothing else.
+POLICY_RULES = [
+    'granted_service_all("a2a") <- role("sam:role:node")',
+    'granted_service_all("sam:system") <- role("sam:role:node")',
+    'target_unrestricted(true) <- role("sam:role:node")',
+]
 
 
 def fake_control_plane(router_addresses):
-    """Approves every enrollment with a biscuit bound to the requesting peer."""
+    """Approves every enrollment with a biscuit bound to the requesting peer.
+    /info lists router_addresses as they are at the time of the request, so
+    a test that changes the list has the member pull the change."""
 
     def transport(method, url, headers, body):
         path = urllib.parse.urlsplit(url).path
@@ -83,6 +111,8 @@ def fake_control_plane(router_addresses):
         if (method, path) == ("GET", "/keys"):
             # Unsigned: the client keeps the enrollment key when /keys cannot be verified.
             return 200, pb.KeysResponse(public_keys=[CP_KEY], sign_time=_ts_ms(int(time.time() * 1000))).SerializeToString()
+        if (method, path) == ("GET", "/info"):
+            return 200, pb.ControlPlaneInfoResponse(router_addresses=list(router_addresses)).SerializeToString()
         return 404, f"no route for {method} {path}".encode()
 
     return transport
@@ -123,11 +153,11 @@ def hop_handler(relay_addr: str, grants, ttl: int = 3600, events=None):
     return handle
 
 
-async def start_router(nursery, role=ROLE_ROUTER, trusted=(CP_KEY,), grants=True, ttl=3600, events=None):
+async def start_router(nursery, role=ROLE_ROUTER, trusted=(CP_KEY,), grants=True, ttl=3600, events=None, identity=None, signer=CP):
     """events, when given, records ("auth", peer) per handshake and ("reserve", peer) per RESERVE."""
-    identity = Identity.generate()
+    identity = identity or Identity.generate()
     router = libp2p_host(identity)
-    router_biscuit = mint(identity.peer_id, role)
+    router_biscuit = mint(identity.peer_id, role, signer=signer)
 
     def on_authenticated(peer, _verified):
         if events is not None:
@@ -148,6 +178,34 @@ async def start_router(nursery, role=ROLE_ROUTER, trusted=(CP_KEY,), grants=True
     nursery.start_soon(run)
     await started.wait()
     return router, addr_box[0]
+
+
+async def start_provider(nursery, biscuit_for, handshakes: list[str]):
+    """A provider answering /sam/auth and /libp2p-http as a member does, with
+    whatever credential biscuit_for gives it; the handshakes it answers are
+    recorded in handshakes."""
+    identity = Identity.generate()
+    host = libp2p_host(identity)
+    biscuit = biscuit_for(identity.peer_id)
+    host.set_stream_handler(AUTH_PROTOCOL, auth_stream_handler(lambda: biscuit, lambda: [CP_KEY], on_authenticated=lambda peer, _v: handshakes.append(peer)))
+
+    async def card(_request, _caller) -> HTTPResponse:
+        return HTTPResponse(status=200, body=b'{"ok": true}')
+
+    options = ProviderOptions(authorizer=ProviderAuthorizerOptions(trusted_keys=lambda: [CP_KEY], own_biscuit=lambda: biscuit, policy_rules=lambda: POLICY_RULES))
+    host.set_stream_handler(HTTP_PROTOCOL, http_ingress_handler(A2AEndpoint(target=card), options))
+    started = trio.Event()
+    addr_box = []
+
+    async def run():
+        async with host.run(listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")]):
+            addr_box.append(f"{host.get_addrs()[0]}")
+            started.set()
+            await trio.sleep_forever()
+
+    nursery.start_soon(run)
+    await started.wait()
+    return host, addr_box[0]
 
 
 async def with_timeout(seconds, fn):
@@ -186,6 +244,54 @@ def test_join_authenticates_reserves_and_answers_peers():
                     ).SerializeToString()
                     with pytest.raises(Exception):
                         await authenticate_with_peer(peer, session.host.get_id(), forged_frame, [CP_KEY])
+            nursery.cancel_scope.cancel()
+
+    trio.run(with_timeout, 30, main)
+
+
+def test_a_resumed_member_adopts_a_rotated_key_before_admitting_routers(tmp_path):
+    """The control plane rotated its signing key while this member was not
+    running: the routers already hold credentials under the new key, and the
+    state directory holds only the key the member enrolled under. join pulls
+    /keys, signed by the retiring key too, before it authenticates a router."""
+    rotated_identity = Identity.generate()
+    rotated = ba.KeyPair.from_private_key(ba.PrivateKey.from_bytes(rotated_identity.seed, ba.Algorithm.Ed25519))
+    rotated_key = rotated_identity.public_key_raw
+
+    def control_plane_after_rotation():
+        def transport(method, url, headers, body):
+            path = urllib.parse.urlsplit(url).path
+            if (method, path) == ("GET", "/keys"):
+                ts = _ts_ms(int(time.time() * 1000))
+                payload = pb.KeysResponse(public_keys=[CP_KEY, rotated_key], sign_time=ts).SerializeToString(deterministic=True)
+                return 200, pb.KeysResponse(
+                    public_keys=[CP_KEY, rotated_key],
+                    sign_time=ts,
+                    signatures=[CP_IDENTITY.sign(payload), rotated_identity.sign(payload)],
+                ).SerializeToString()
+            if (method, path) == ("POST", "/refresh"):
+                peer_id = pb.TokenRefreshRequest.FromString(body).peer_id
+                return 200, pb.TokenRefreshResponse(
+                    biscuit_token=mint(peer_id, ROLE_NODE, signer=rotated), expire_time=_ts_s(int(time.time()) + 7200)
+                ).SerializeToString()
+            return 404, f"no route for {method} {path}".encode()
+
+        return transport
+
+    async def main():
+        async with trio.open_nursery() as nursery:
+            router, router_addr = await start_router(nursery, trusted=(CP_KEY, rotated_key), signer=rotated)
+            # Enrolled before the rotation: the credential on disk trusts one key.
+            before = AgentMesh.enroll("http://127.0.0.1:1", bootstrap_token="sbt", state_dir=tmp_path, transport=fake_control_plane([router_addr]))
+            assert [bytes(k) for k in before.credential.control_plane_keys] == [CP_KEY]
+
+            # Resumed after it, with the routers now under the new key.
+            resumed = AgentMesh.enroll("http://127.0.0.1:1", state_dir=tmp_path, transport=control_plane_after_rotation())
+            assert resumed.credential.biscuit == before.credential.biscuit
+            async with resumed.join(reserve=False) as session:
+                assert [r.peer_id for r in session.routers] == [str(router.get_id())]
+            assert {bytes(k) for k in resumed.credential.control_plane_keys} == {CP_KEY, rotated_key}
+            assert resumed.credential.biscuit != before.credential.biscuit
             nursery.cancel_scope.cancel()
 
     trio.run(with_timeout, 30, main)
@@ -258,6 +364,200 @@ def test_join_admits_every_router_and_reserves_on_the_first():
     trio.run(with_timeout, 30, main)
 
 
+def test_a_router_nobody_answers_costs_join_one_dial_timeout(monkeypatch):
+    """The control plane may list a router this member cannot reach (a
+    public address a network policy drops). Every router is dialed at once,
+    so join ends at DIAL_TIMEOUT whatever the dark one's position, and the
+    reservation still goes to the first *admitted* router of the list."""
+    from agent_mesh import session as session_module
+    from agent_mesh.host import DIAL_TIMEOUT
+
+    dark = "/ip4/203.0.113.7/tcp/4501/p2p/12D3KooWGvdRCJLYATauVWfsieF2j3a2wXZoEQJUS2MsvRdDtgLM"
+    router_a = "/ip4/10.0.0.1/tcp/4501/p2p/12D3KooWG1pA6goegCncqwbZLSr8pnjUZ6JMAAe6SmnHTgUNCk88"
+    router_b = "/ip4/10.0.0.2/tcp/4501/p2p/12D3KooWBTdQ3QQZztZFaxQSTzJx5ZSbpgM8zfs43VYzBXAFkdZm"
+    reserved = []
+
+    class Host:
+        def get_peerstore(self):
+            return PeerStore()
+
+        def get_network(self):
+            return None
+
+        async def connect(self, info):
+            if str(info.addrs[0]).startswith("/ip4/203.0.113.7/"):
+                await trio.sleep_forever()
+
+    async def authenticated(host, mesh, peer_id):
+        return f"credential of {peer_id}"
+
+    async def reserve(host, peer_id):
+        reserved.append(str(peer_id))
+        return circuit.Reservation()
+
+    monkeypatch.setattr(session_module, "_authenticate_router", authenticated)
+    monkeypatch.setattr(session_module, "reserve_relay", reserve)
+
+    async def main():
+        started = trio.current_time()
+        routers = await session_module._admit(Host(), None, [multiaddr.Multiaddr(a) for a in (dark, router_a, router_b)], reserve=True)
+        assert trio.current_time() - started == pytest.approx(DIAL_TIMEOUT)
+        assert [r.peer_id[-6:] for r in routers] == ["UNCk88", "AFkdZm"]
+        assert [r.reservation is not None for r in routers] == [True, False]
+        assert [p[-6:] for p in reserved] == ["UNCk88"]
+
+    trio.run(main, clock=trio.testing.MockClock(autojump_threshold=0))
+
+
+def test_connect_dials_the_routers_at_once():
+    """A relay whose destination a rollout replaced answers a CONNECT only
+    after its own timeout. The routers are dialed at once, so a dead peer
+    costs the caller one such wait, not one per router, and the first
+    circuit that opens ends the other attempts."""
+    router_ids = [
+        "12D3KooWG1pA6goegCncqwbZLSr8pnjUZ6JMAAe6SmnHTgUNCk88",
+        "12D3KooWGvdRCJLYATauVWfsieF2j3a2wXZoEQJUS2MsvRdDtgLM",
+        "12D3KooWBTdQ3QQZztZFaxQSTzJx5ZSbpgM8zfs43VYzBXAFkdZm",
+    ]
+    target = "12D3KooWA4Xop1JaT3MHxwYMkCepYsv4iPVopMXwCz5iHYdBfeSB"
+    routers = [AdmittedRouter(peer_id=p, addr=multiaddr.Multiaddr(f"/ip4/10.0.0.{i}/tcp/4501/p2p/{p}"), credential=None) for i, p in enumerate(router_ids, 1)]  # type: ignore[arg-type]
+
+    class Host:
+        def get_connected_peers(self):
+            return []
+
+    session = MeshSession(mesh=None, host=Host(), routers=routers)  # type: ignore[arg-type]
+    dialed: list[str] = []
+    ended: list[str] = []
+
+    def relay_of(ma) -> str:
+        return str(ma).split("/p2p/")[1].split("/")[0][-6:]
+
+    async def nothing(_target):
+        return [], []
+
+    session._routed_addresses = nothing  # type: ignore[method-assign]
+    session._unjoined_routers = lambda _target: []  # type: ignore[method-assign]
+
+    async def main():
+        # Every relay waits on a destination that is gone.
+        async def all_wait(ma):
+            dialed.append(relay_of(ma))
+            try:
+                await trio.sleep(10)
+            finally:
+                ended.append(relay_of(ma))
+            raise RuntimeError("CONNECTION_FAILED")
+
+        session._connect_addr = all_wait  # type: ignore[method-assign]
+        started = trio.current_time()
+        with pytest.raises(ConnectionError) as err:
+            await session.connect(target)
+        assert trio.current_time() - started == pytest.approx(10)
+        assert sorted(dialed) == sorted(p[-6:] for p in router_ids)
+        assert str(err.value).count("CONNECTION_FAILED") == 3
+
+        # One relays for the peer; its circuit ends the others' waits.
+        dialed.clear()
+        ended.clear()
+
+        async def one_opens(ma):
+            dialed.append(relay_of(ma))
+            if relay_of(ma) == router_ids[1][-6:]:
+                await trio.sleep(1)
+                return ID.from_base58(target)
+            try:
+                await trio.sleep(10)
+            finally:
+                ended.append(relay_of(ma))
+            raise RuntimeError("CONNECTION_FAILED")
+
+        session._connect_addr = one_opens  # type: ignore[method-assign]
+        started = trio.current_time()
+        assert await session.connect(target) == ID.from_base58(target)
+        assert trio.current_time() - started == pytest.approx(1)
+        assert sorted(ended) == sorted(p[-6:] for p in (router_ids[0], router_ids[2]))
+
+    trio.run(main, clock=trio.testing.MockClock(autojump_threshold=0))
+
+
+def test_a_replaced_peer_costs_connect_one_dial_timeout_per_step(monkeypatch):
+    """A provider record can name a pod a rollout replaced: its address
+    answers nothing, the admitted routers refuse the circuit at once, the DHT
+    names the same address again, and the control plane lists routers this
+    member has not joined through, one of them dark. The address and the
+    routers are dialed at once, the DHT's copy of the address is not dialed
+    again, and the routers not joined through are admitted at once: two
+    dial timeouts in all, one per step."""
+    from agent_mesh import session as session_module
+    from agent_mesh.host import DIAL_TIMEOUT
+
+    admitted_id = "12D3KooWG1pA6goegCncqwbZLSr8pnjUZ6JMAAe6SmnHTgUNCk88"
+    unjoined = {
+        "12D3KooWGvdRCJLYATauVWfsieF2j3a2wXZoEQJUS2MsvRdDtgLM": "/ip4/10.0.0.2/tcp/4501",
+        "12D3KooWBTdQ3QQZztZFaxQSTzJx5ZSbpgM8zfs43VYzBXAFkdZm": "/ip4/203.0.113.7/tcp/4501",
+    }
+    target = "12D3KooWA4Xop1JaT3MHxwYMkCepYsv4iPVopMXwCz5iHYdBfeSB"
+    dead = "/ip4/10.84.4.137/tcp/5002"
+
+    class Host:
+        def get_connected_peers(self):
+            return []
+
+    class Credential:
+        router_addresses = [f"/ip4/10.0.0.1/tcp/4501/p2p/{admitted_id}"] + [f"{a}/p2p/{p}" for p, a in unjoined.items()]
+
+    class Mesh:
+        credential = Credential()
+
+    session = MeshSession(
+        mesh=Mesh(),  # type: ignore[arg-type]
+        host=Host(),  # type: ignore[arg-type]
+        routers=[AdmittedRouter(peer_id=admitted_id, addr=multiaddr.Multiaddr(f"/ip4/10.0.0.1/tcp/4501/p2p/{admitted_id}"), credential=None)],  # type: ignore[arg-type]
+    )
+    dials: list[list[str]] = []
+    admissions: list[tuple[str, float]] = []
+    circuits: list[str] = []
+
+    async def dial_nobody_answers(host, info):
+        dials.append([str(a) for a in info.addrs])
+        await trio.sleep(DIAL_TIMEOUT)
+        raise ConnectionError(f"no connection to {info.peer_id} within {DIAL_TIMEOUT:g}s")
+
+    async def refused(ma):
+        circuits.append(str(ma))
+        raise RuntimeError("relay refused to connect: PERMISSION_DENIED")
+
+    async def dht_names_the_same_address(_target):
+        return [multiaddr.Multiaddr(dead)], []
+
+    async def admit_nobody_answers(addr):
+        admissions.append((str(addr), trio.current_time()))
+        await trio.sleep(DIAL_TIMEOUT)
+        raise ConnectionError(f"no connection to {addr} within {DIAL_TIMEOUT:g}s")
+
+    monkeypatch.setattr(session_module, "dial", dial_nobody_answers)
+    session._connect_addr = refused  # type: ignore[method-assign]
+    session._routed_addresses = dht_names_the_same_address  # type: ignore[method-assign]
+    session._admit_router = admit_nobody_answers  # type: ignore[method-assign]
+
+    async def main():
+        started = trio.current_time()
+        provider = DiscoveredProvider(peer_id=target, addrs=[f"{dead}/p2p/{target}", f"/ip4/10.84.4.137/udp/5001/quic-v1/p2p/{target}"])
+        with pytest.raises(ConnectionError) as err:
+            await session.connect(provider)
+        assert trio.current_time() - started == pytest.approx(2 * DIAL_TIMEOUT)
+        # The dead address once, with the admitted router's circuit alongside.
+        assert dials == [[dead]]
+        assert circuits == [f"/ip4/10.0.0.1/tcp/4501/p2p/{admitted_id}/p2p-circuit/p2p/{target}"]
+        # Both routers not joined through, admitted at the same instant.
+        assert sorted(a for a, _ in admissions) == sorted(f"{a}/p2p/{p}" for p, a in unjoined.items())
+        assert len({t for _, t in admissions}) == 1
+        assert str(err.value).count("within 15s") == 3
+
+    trio.run(main, clock=trio.testing.MockClock(autojump_threshold=0))
+
+
 def test_a_dropped_router_connection_is_reserved_again_before_the_ttl():
     """A router restart takes the reservation with the connection. The member
     notices within the check interval and reserves again, authenticated
@@ -282,6 +582,111 @@ def test_a_dropped_router_connection_is_reserved_again_before_the_ttl():
                 assert events[2:] == [("auth", mesh.peer_id), ("reserve", mesh.peer_id)]
                 assert member in router.get_connected_peers()
                 assert session.relay_addresses == [f"{addr}/p2p-circuit/p2p/{mesh.peer_id}"]
+            nursery.cancel_scope.cancel()
+
+    trio.run(with_timeout, 60, main)
+
+
+def test_a_router_that_came_back_on_another_address_is_reserved_on_again(monkeypatch):
+    """A router pod rescheduled keeps its key and gets a new IP; the name the
+    control plane hands out resolves to it. The member's connection went with
+    the old pod; the reservation loop dials the router by name again and must
+    land on the new address, not on the one the peerstore remembers from the
+    old pod, and advertise the relayed address the new pod lists."""
+    from multiaddr.resolvers import DNSResolver
+
+    class TXT:
+        def __init__(self, strings):
+            self.strings = strings
+
+        def __iter__(self):
+            for s in self.strings:
+                yield type("TXT", (), {"strings": [s.encode()]})()
+
+        def __len__(self):
+            return len(self.strings)
+
+    records: dict[str, list[str]] = {}
+
+    class FakeDNS:
+        async def resolve(self, name, rdtype):
+            return TXT(records.get(str(name).rstrip("."), []))
+
+    monkeypatch.setattr(DNSResolver, "__init__", lambda self: setattr(self, "_resolver", FakeDNS()))
+
+    async def wait_for(predicate):
+        while not predicate():
+            await trio.sleep(0.1)
+
+    async def main():
+        async with trio.open_nursery() as nursery:
+            identity = Identity.generate()
+            before_events, after_events = [], []
+            before, before_addr = await start_router(nursery, events=before_events, identity=identity)
+            after, after_addr = await start_router(nursery, events=after_events, identity=identity)
+            name = f"/dnsaddr/router.test/p2p/{identity.peer_id}"
+            records["_dnsaddr.router.test"] = [f"dnsaddr={before_addr}"]
+
+            mesh = AgentMesh.enroll("http://127.0.0.1:1", bootstrap_token="sbt", transport=fake_control_plane([name]))
+            async with mesh.join(refresh_lead=0, refresh_retry=0.5, reservation_check_interval=0.5) as session:
+                member = session.host.get_id()
+                assert before_events == [("auth", mesh.peer_id), ("reserve", mesh.peer_id)]
+                assert session.relay_addresses == [f"{before_addr}/p2p-circuit/p2p/{mesh.peer_id}"]
+
+                # The pod goes: its connection with it, and the name now resolves to the new one.
+                records["_dnsaddr.router.test"] = [f"dnsaddr={after_addr}"]
+                await before.disconnect(member)
+                await wait_for(lambda: member not in before.get_connected_peers())
+
+                reserve = ("reserve", mesh.peer_id)
+                await wait_for(lambda: before_events.count(reserve) + after_events.count(reserve) >= 2)
+                assert before_events.count(reserve) == 1, "dialed the old pod's address again"
+                assert after_events == [("auth", mesh.peer_id), reserve]
+                assert member in after.get_connected_peers()
+                assert session.relay_addresses == [f"{after_addr}/p2p-circuit/p2p/{mesh.peer_id}"]
+            nursery.cancel_scope.cancel()
+
+    trio.run(with_timeout, 60, main)
+
+
+def test_a_router_the_control_plane_lists_elsewhere_is_reserved_on_there():
+    """A mesh that hands out literal addresses (sam-one, a kind cluster) has
+    no name to re-resolve: a router that came back on another address is
+    known only through the control plane's list, refreshed by every pull.
+    The reservation loop dials the router at the address that list names
+    now and keeps it as the router's address, so the circuits connect()
+    opens through it go to the right place too."""
+
+    async def wait_for(predicate):
+        while not predicate():
+            await trio.sleep(0.1)
+
+    async def main():
+        async with trio.open_nursery() as nursery:
+            identity = Identity.generate()
+            before_events, after_events = [], []
+            before, before_addr = await start_router(nursery, events=before_events, identity=identity)
+            after, after_addr = await start_router(nursery, events=after_events, identity=identity)
+            listed = [before_addr]
+
+            mesh = AgentMesh.enroll("http://127.0.0.1:1", bootstrap_token="sbt", transport=fake_control_plane(listed))
+            async with mesh.join(refresh_lead=0, refresh_retry=0.5, reservation_check_interval=0.5) as session:
+                member = session.host.get_id()
+                assert [str(r.addr) for r in session.routers] == [before_addr]
+
+                # The control plane lists the router where it is now; the member pulls that.
+                listed[:] = [after_addr]
+                await session.sync()
+                assert list(mesh.credential.router_addresses) == [after_addr]
+                await before.disconnect(member)
+                await wait_for(lambda: member not in before.get_connected_peers())
+
+                reserve = ("reserve", mesh.peer_id)
+                await wait_for(lambda: before_events.count(reserve) + after_events.count(reserve) >= 2)
+                assert before_events.count(reserve) == 1, "dialed the address admitted at join again"
+                assert after_events == [("auth", mesh.peer_id), reserve]
+                assert [str(r.addr) for r in session.routers] == [after_addr]
+                assert session.relay_addresses == [f"{after_addr}/p2p-circuit/p2p/{mesh.peer_id}"]
             nursery.cancel_scope.cancel()
 
     trio.run(with_timeout, 60, main)
@@ -346,6 +751,60 @@ def test_a_refused_renewal_drops_the_connection_and_the_retry_authenticates_agai
                 await wait_for(lambda: session.routers[0].reservation.expire > first)
                 auth, reserve = ("auth", mesh.peer_id), ("reserve", mesh.peer_id)
                 assert events[:5] == [auth, reserve, reserve, auth, reserve]
+            nursery.cancel_scope.cancel()
+
+    trio.run(with_timeout, 60, main)
+
+
+def test_an_egress_floor_stated_at_join_is_held_on_the_http_path():
+    """The floor is held on request() and on MeshTransport, and the provider
+    is verified as an enrolled member with or without one."""
+
+    async def main():
+        async with trio.open_nursery() as nursery:
+            _, router_addr = await start_router(nursery)
+            handshakes: list[str] = []
+            provider, provider_addr = await start_provider(nursery, lambda p: mint(p, ROLE_NODE, labels={"region": "eu"}), handshakes)
+            # Enrolled nowhere: a credential no trusted key signed.
+            forged = ba.KeyPair()
+            _, impostor_addr = await start_provider(
+                nursery, lambda p: ba.BiscuitBuilder("node({p}); expiration(2035-01-01T00:00:00Z);", {"p": p}).build(forged.private_key).to_bytes(), handshakes
+            )
+            # Enrolled and attesting the floor, but not a node: a router hosts no service.
+            _, not_a_node_addr = await start_provider(nursery, lambda p: mint(p, ROLE_ROUTER, labels={"region": "eu"}), handshakes)
+
+            def join(**options):
+                mesh = AgentMesh.enroll("http://127.0.0.1:1", bootstrap_token="sbt", transport=fake_control_plane([router_addr]))
+                return mesh.join(reserve=False, refresh_lead=0, **options)
+
+            async with join(egress_require_labels={"region": "eu"}) as held, join(egress_require_labels={"region": "eu", "team": "platform"}) as missed, join() as plain:
+                card = MeshSession.mesh_url(str(provider.get_id()), "a2a://agent", "/card")
+                # Met: one handshake verifies the provider; the verdict is kept for the next calls.
+                assert (await held.request(provider_addr, "a2a://agent", "/card")).status == 200
+                assert (await held.request(provider_addr, "a2a://agent", "/card")).status == 200
+                async with httpx.AsyncClient(transport=MeshTransport(held)) as client:
+                    assert (await client.get(card)).status_code == 200
+                assert handshakes == [held.peer_id]
+
+                # Missed: every path refuses, and a refusal is not kept: each call asks again.
+                with pytest.raises(LabelsNotSatisfiedError):
+                    await missed.request(provider_addr, "a2a://agent", "/card")
+                async with httpx.AsyncClient(transport=MeshTransport(missed)) as client:
+                    with pytest.raises(LabelsNotSatisfiedError):
+                        await client.get(card)
+                assert handshakes == [held.peer_id, missed.peer_id, missed.peer_id]
+
+                # No floor: no gate, but the provider is verified all the same.
+                assert (await plain.request(provider_addr, "a2a://agent", "/card")).status == 200
+                with pytest.raises(BiscuitVerificationError):
+                    await plain.request(impostor_addr, "a2a://agent", "/card")
+                # A banned provider is refused before any handshake.
+                plain.banned.add(str(provider.get_id()), int(time.time() * 1000))
+                with pytest.raises(PermissionError, match="banned"):
+                    await plain.request(provider_addr, "a2a://agent", "/card")
+                # Only nodes host services, as sam-node's checkPeerLabels requires.
+                with pytest.raises(BiscuitVerificationError, match="lacks expected role 'sam:role:node'"):
+                    await held.request(not_a_node_addr, "a2a://agent", "/card")
             nursery.cancel_scope.cancel()
 
     trio.run(with_timeout, 60, main)

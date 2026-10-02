@@ -34,6 +34,7 @@ from libp2p.crypto.ed25519 import create_new_key_pair
 from libp2p.crypto.x25519 import create_new_key_pair as create_new_x25519_key_pair
 from libp2p.custom_types import TProtocol
 from libp2p.network.config import ConnectionConfig
+from libp2p.network.swarm import Swarm
 from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo, info_from_p2p_addr
 from libp2p.security.noise.transport import PROTOCOL_ID as NOISE_PROTOCOL_ID
@@ -122,6 +123,39 @@ def _dial_websockets_by_name(transport: WebsocketTransport) -> None:
     transport.dial = dial  # type: ignore[method-assign]
 
 
+# sam-node's swarm dial timeout. py-libp2p has none of its own: a SYN to an
+# address nobody answers waits on the kernel, about two minutes, and is then
+# retried, and a provider record can name a pod a rollout just replaced. A
+# router the control plane lists may be unreachable from where a member runs
+# (a public address a network policy drops), and the routers' DHT names it as
+# a closer peer to every lookup.
+DIAL_TIMEOUT = 15.0
+
+# How long open_stream waits for the close of a connection it gave up on.
+HANGUP_GRACE = 1.0
+
+
+async def dial(host: IHost, info: PeerInfo) -> None:
+    """host.connect at the addresses given, bounded by DIAL_TIMEOUT. What the
+    host remembers of the peer is dropped first. py-libp2p dials one address
+    per transport, the first its peerstore holds, and host.connect only
+    appends to that list: a router or provider that came back on another
+    address, a pod rescheduled with the same key, would be dialed at the old
+    one on every retry, whatever the caller had just resolved. The swarm's
+    negative cache is keyed by peer, not by address, and would refuse the new
+    address for a minute after the old one failed, so the peer is taken out
+    of it as well."""
+    host.get_peerstore().clear_addrs(info.peer_id)
+    network = host.get_network()
+    if isinstance(network, Swarm):
+        network.unblock_peer(info.peer_id)
+    try:
+        with trio.fail_after(DIAL_TIMEOUT):
+            await host.connect(info)
+    except trio.TooSlowError:
+        raise ConnectionError(f"no connection to {info.peer_id} within {DIAL_TIMEOUT:g}s") from None
+
+
 async def open_stream(host: IHost, peer_id: ID, protocol: TProtocol, timeout: float) -> INetStream:
     """host.new_stream bounded by a timeout. py-libp2p bounds the protocol
     negotiation but not the muxer, and a muxer that cannot open a stream
@@ -133,7 +167,9 @@ async def open_stream(host: IHost, peer_id: ID, protocol: TProtocol, timeout: fl
         with trio.fail_after(timeout):
             return await host.new_stream(peer_id, [protocol])
     except trio.TooSlowError:
-        with trio.CancelScope(shield=True):
+        # Closing writes a GO_AWAY on the very connection that stalled; give
+        # it a moment, then let the peer time the socket out on its own.
+        with trio.CancelScope(shield=True), trio.move_on_after(min(timeout, HANGUP_GRACE)):
             try:
                 await host.disconnect(peer_id)
             except Exception:  # noqa: BLE001 - already gone

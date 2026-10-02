@@ -22,7 +22,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { JSONRPCMessageSchema, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { AUTH_HANDSHAKE_TIMEOUT_MS, AuthRejectedError, MAX_AUTH_FRAME_BYTES, MCP_PROTOCOL } from "./auth.ts";
-import { BiscuitVerificationError, verifyPeerBiscuit, type VerifiedBiscuit } from "./biscuit.ts";
+import { BiscuitVerificationError, requireRole, verifyPeerBiscuit, type VerifiedBiscuit } from "./biscuit.ts";
+import { ROLE_NODE } from "./controlplane.ts";
 import { decodeAuthResponse } from "./credential.ts";
 
 /** go-msgio's default message cap, which sam-node's StreamTransport uses. */
@@ -87,7 +88,7 @@ export class StreamTransport implements Transport {
 }
 
 export interface MCPSessionOptions {
-  /** Labels the provider's credential must carry, e.g. { region: "eu" }. */
+  /** Labels the provider's credential must all carry, e.g. { region: "eu", compliance: "gdpr" }. */
   requiredLabels?: Record<string, string>;
   /** The agent this call is made for; attribution beside the token, as in sam-node. */
   agent?: string;
@@ -102,44 +103,63 @@ export interface MCPSession {
   close(): Promise<void>;
 }
 
-/** The provider's credential carries none of the labels the caller requires (checkPeerLabels). */
+/**
+ * The provider's credential lacks a label the caller requires or a label of
+ * the session's egress floor, as checkPeerLabels refuses.
+ */
 export class LabelsNotSatisfiedError extends Error {
-  constructor(peerId: string, required: string[]) {
-    super(`peer ${peerId} carries none of the required labels: ${required.join(", ")}`);
+  constructor(peerId: string, required: string[], what: string) {
+    super(`peer ${peerId} ${what}: ${required.join(", ")}`);
     this.name = "LabelsNotSatisfiedError";
   }
 }
 
-/**
- * A caller's requirement is satisfied by any one pair, as sam-node's
- * api.LabelCheck (`check if label(k1, v1) or label(k2, v2)`): several pairs
- * mean "any of these will do". The operator's egress floor is the
- * conjunction, and sam-node's alone.
- */
-export function requireLabels(provider: VerifiedBiscuit, required: Record<string, string> | undefined): void {
+function requireEveryPair(provider: VerifiedBiscuit, required: Record<string, string> | undefined, what: string): void {
   if (!required) {
     return;
   }
   const pairs = Object.entries(required);
-  if (pairs.length === 0 || pairs.some(([k, v]) => provider.labels[k] === v)) {
+  if (pairs.every(([k, v]) => provider.labels[k] === v)) {
     return;
   }
   throw new LabelsNotSatisfiedError(
     provider.peerId,
     pairs.map(([k, v]) => `${k}=${v}`),
+    what,
   );
+}
+
+/**
+ * A requirement is satisfied only when the provider attests every pair, as
+ * sam-node's api.LabelCheck (`check if label(k1, v1), label(k2, v2)`), the
+ * same rule as the egress floor. A map holds one value per key, so listing
+ * several pairs narrows the acceptable providers. Empty is no requirement.
+ */
+export function requireLabels(provider: VerifiedBiscuit, required: Record<string, string> | undefined): void {
+  requireEveryPair(provider, required, "does not attest every required label");
+}
+
+/**
+ * The session's egress floor, sam-node's egress.require_labels: the same
+ * rule as requireLabels, refused with a message that names the floor. Empty
+ * is no floor.
+ */
+export function requireEgressLabels(provider: VerifiedBiscuit, required: Record<string, string> | undefined): void {
+  requireEveryPair(provider, required, "does not attest the egress floor");
 }
 
 /**
  * Opens /sam/mcp/1.0.0 to a connected provider for targetService ("" is the
  * provider's own catalog), verifies the provider, and returns a connected
- * MCP client. frame is this member's AuthFrame for that service.
+ * MCP client. frame is this member's AuthFrame for that service; egressRequireLabels
+ * is the session's, not the caller's (requireEgressLabels).
  */
 export async function openMCPSession(
   conn: Connection,
   frame: Uint8Array,
   trustedKeys: Uint8Array[],
   options: MCPSessionOptions = {},
+  egressRequireLabels?: Record<string, string>,
 ): Promise<MCPSession> {
   const signal = options.signal ?? AbortSignal.timeout(AUTH_HANDSHAKE_TIMEOUT_MS);
   const stream = await conn.newStream(MCP_PROTOCOL, { signal, runOnLimitedConnection: true });
@@ -153,7 +173,10 @@ export async function openMCPSession(
       throw new AuthRejectedError(conn.remotePeer.toString(), resp.error || "no reason given");
     }
     provider = await verifyPeerBiscuit(resp.biscuit, conn.remotePeer.toString(), trustedKeys);
+    // Only nodes host services; a router's or an admin's credential is a member, not a provider.
+    requireRole(provider, ROLE_NODE);
     requireLabels(provider, options.requiredLabels);
+    requireEgressLabels(provider, egressRequireLabels);
   } catch (err) {
     await stream.close().catch(() => stream.abort(err instanceof Error ? err : new Error(String(err))));
     if (err instanceof BiscuitVerificationError) {

@@ -33,11 +33,11 @@ from mcp.shared.message import SessionMessage
 
 from agent_mesh._proto import sam_pb2 as pb
 from agent_mesh.auth import MCP_PROTOCOL, AuthRejectedError
-from agent_mesh.biscuit import VerifiedBiscuit, verify_peer_biscuit
+from agent_mesh.biscuit import ROLE_ROUTER, VerifiedBiscuit, verify_peer_biscuit
 from agent_mesh.controlplane import ROLE_NODE
 from agent_mesh.discovery import parse_service_target, service_key
 from agent_mesh.identity import Identity
-from agent_mesh.mcp_client import LabelsNotSatisfiedError, open_mcp_session, require_labels, tool_call_result
+from agent_mesh.mcp_client import LabelsNotSatisfiedError, open_mcp_session, require_egress_labels, require_labels, tool_call_result
 
 from .test_session import CP, CP_KEY, libp2p_host
 
@@ -129,10 +129,10 @@ def mcp_stream_handler(provider_biscuit: bytes, served: list[str]):
     return handle
 
 
-async def start_provider(nursery, labels=None):
+async def start_provider(nursery, labels=None, role=ROLE_NODE):
     identity = Identity.generate()
     host = libp2p_host(identity)
-    biscuit = mint(identity.peer_id, ROLE_NODE, labels)
+    biscuit = mint(identity.peer_id, role, labels)
     served: list[str] = []
     host.set_stream_handler(MCP_PROTOCOL, mcp_stream_handler(biscuit, served))
     started = trio.Event()
@@ -193,9 +193,24 @@ def test_tools_over_the_mesh_stream():
                 with pytest.raises(LabelsNotSatisfiedError):
                     async with open_mcp_session(caller, pid, frame(caller_biscuit, "mcp://calc"), [CP_KEY], required_labels={"region": "us"}):
                         pass
-                # Several pairs are met by any one of them; the provider attests region=eu only.
-                async with open_mcp_session(caller, pid, frame(caller_biscuit, "mcp://calc"), [CP_KEY], required_labels={"region": "eu", "team": "platform"}):
+                # Several pairs must all be attested; the provider attests region=eu only.
+                with pytest.raises(LabelsNotSatisfiedError):
+                    async with open_mcp_session(caller, pid, frame(caller_biscuit, "mcp://calc"), [CP_KEY], required_labels={"region": "eu", "team": "platform"}):
+                        pass
+
+                # The egress floor is met only by every one of its pairs, beside the caller's requirement.
+                async with open_mcp_session(caller, pid, frame(caller_biscuit, "mcp://calc"), [CP_KEY], egress_require_labels={"region": "eu"}):
                     pass
+                with pytest.raises(LabelsNotSatisfiedError, match="does not attest the egress floor: region=eu, team=platform"):
+                    async with open_mcp_session(caller, pid, frame(caller_biscuit, "mcp://calc"), [CP_KEY], egress_require_labels={"region": "eu", "team": "platform"}):
+                        pass
+                # Both apply when both are set: neither one's pairs stand in for the other's.
+                with pytest.raises(LabelsNotSatisfiedError):
+                    async with open_mcp_session(caller, pid, frame(caller_biscuit, "mcp://calc"), [CP_KEY], required_labels={"region": "eu"}, egress_require_labels={"team": "platform"}):
+                        pass
+                with pytest.raises(LabelsNotSatisfiedError):
+                    async with open_mcp_session(caller, pid, frame(caller_biscuit, "mcp://calc"), [CP_KEY], required_labels={"team": "platform"}, egress_require_labels={"region": "eu"}):
+                        pass
 
                 # A provider whose credential the caller does not trust is rejected.
                 with pytest.raises(AuthRejectedError):
@@ -213,6 +228,13 @@ def test_tools_over_the_mesh_stream():
                     with trio.fail_after(5):
                         async with open_mcp_session(caller, pid, frame(caller_biscuit, "mcp://no-such-service"), [CP_KEY]):
                             pass
+
+                # Only a node is a provider, as sam-node's checkPeerLabels requires: a router attesting the floor is not.
+                router, router_addr, _ = await start_provider(nursery, labels={"region": "eu"}, role=ROLE_ROUTER)
+                await caller.connect(info_from_p2p_addr(router_addr))
+                with pytest.raises(AuthRejectedError, match="lacks expected role 'sam:role:node'"):
+                    async with open_mcp_session(caller, router.get_id(), frame(caller_biscuit, "mcp://calc"), [CP_KEY], egress_require_labels={"region": "eu"}):
+                        pass
             nursery.cancel_scope.cancel()
 
     async def with_timeout():
@@ -222,9 +244,9 @@ def test_tools_over_the_mesh_stream():
     trio.run(with_timeout)
 
 
-def test_a_requirement_of_several_labels_is_met_by_any_one_of_them():
+def test_a_requirement_of_several_labels_is_met_only_by_every_one_of_them():
     """The cases of internal/node/labels_gate_test.go, run through the SDK's
-    predicate: a caller naming several pairs means any of these will do, as
+    predicate: a caller naming several pairs requires all of them, as
     sam-node's checkPeerLabels and api.LabelCheck read it."""
     from datetime import datetime, timezone
 
@@ -233,17 +255,43 @@ def test_a_requirement_of_several_labels_is_met_by_any_one_of_them():
 
     # exact match
     require_labels(attesting({"region": "us-east-1"}), {"region": "us-east-1"})
-    # any-of requirement matches one key
-    require_labels(attesting({"region": "na-us", "team": "platform"}), {"region": "eu", "team": "platform"})
+    # every pair of two attested
+    require_labels(attesting({"region": "na-us", "team": "platform"}), {"region": "na-us", "team": "platform"})
+    # one pair of two wrong fails, naming the whole requirement
+    with pytest.raises(LabelsNotSatisfiedError, match="does not attest every required label: region=eu, team=platform"):
+        require_labels(attesting({"region": "na-us", "team": "platform"}), {"region": "eu", "team": "platform"})
+    # one pair of two missing fails
+    with pytest.raises(LabelsNotSatisfiedError):
+        require_labels(attesting({"region": "na-us"}), {"region": "na-us", "team": "platform"})
     # no built-in hierarchy: coarser requirement fails a finer claim
     with pytest.raises(LabelsNotSatisfiedError):
         require_labels(attesting({"region": "us-east-1"}), {"region": "us"})
     # disjoint labels fail
     with pytest.raises(LabelsNotSatisfiedError):
         require_labels(attesting({"region": "na-us"}), {"region": "eu"})
-    # unattested token fails closed, naming every pair the caller asked for
-    with pytest.raises(LabelsNotSatisfiedError, match="region=eu, team=platform"):
+    # unattested token fails closed
+    with pytest.raises(LabelsNotSatisfiedError):
         require_labels(attesting({}), {"region": "eu", "team": "platform"})
     # an empty requirement is no requirement
     require_labels(attesting({}), {})
     require_labels(attesting({}), None)
+
+
+def test_the_egress_floor_is_met_only_by_every_one_of_its_pairs():
+    """sam-node's api.LabelCheck for egress.require_labels, run through the
+    SDK's predicate: a floor takes no alternatives."""
+    from datetime import datetime, timezone
+
+    def attesting(labels: dict) -> VerifiedBiscuit:
+        return VerifiedBiscuit(peer_id="p", expiration=datetime.now(timezone.utc), verifying_key=CP_KEY, roles=[], labels=labels)
+
+    require_egress_labels(attesting({"region": "eu", "team": "platform"}), {"region": "eu"})
+    require_egress_labels(attesting({"region": "eu", "team": "platform"}), {"region": "eu", "team": "platform"})
+    # one pair short is a refusal that names the whole floor
+    with pytest.raises(LabelsNotSatisfiedError, match="peer p does not attest the egress floor: region=eu, team=platform"):
+        require_egress_labels(attesting({"region": "eu"}), {"region": "eu", "team": "platform"})
+    with pytest.raises(LabelsNotSatisfiedError):
+        require_egress_labels(attesting({"region": "us"}), {"region": "eu"})
+    # no floor is no floor
+    require_egress_labels(attesting({}), {})
+    require_egress_labels(attesting({}), None)

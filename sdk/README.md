@@ -50,7 +50,7 @@ Milestones 1 to 5 are implemented and tested in both languages:
 | The mesh as a transport for HTTP clients: `session.fetch()` for fetch-based clients, `MeshTransport` for httpx, so the official A2A SDK's client works unchanged | `fetch` | httpx |
 | Provider authorizer: the baseline Datalog and the mesh policy (`GET /policies`), evaluated as `sam-node` does | yes | yes |
 | A2A ingress for the agent: `/libp2p-http` for `a2a://<name>`, forwarded to an A2A server beside the process or answered in it; not announced anywhere | yes | yes |
-| Control plane pull on `sam-node`'s interval: `/keys` verified against the trusted set, credential refresh after a rotation, `/info` bans and router addresses | yes | yes |
+| Control plane pull before join and on `sam-node`'s interval: `/keys` verified against the trusted set, credential refresh after a rotation, `/info` bans and router addresses | yes | yes |
 | Gossip events from the control plane (`/sam/mesh/events/v1`, StrictSign): ban enforced at once, key rotation adopted, policy update pulls | yes | yes |
 | Banned peers refused: connections dropped and denied, handshakes and requests refused, dials refused | yes | yes |
 | Runs in a browser page: WebSocket and Noise to the router, state in IndexedDB, the agent answered by a fetch handler; `sdk/js/examples/browser` against `sam-one`, tested in Chromium | yes | — |
@@ -92,14 +92,18 @@ pinned by a test:
 - js-libp2p reserves a relay slot when it starts listening on
   `<relay>/p2p-circuit`, and a router refuses that before the auth
   handshake. The JS SDK starts the listener after the handshake, through the
-  transport manager, which is not on the public `Libp2p` interface.
+  transport manager, which is not on the public `Libp2p` interface
+  ([libp2p/js-libp2p#3645](https://github.com/libp2p/js-libp2p/issues/3645)).
 - go-libp2p's relay grants a reservation for one hour and drops it when
   that passes, and with the connection it was made on; a member that still
   advertises the relayed address is then unreachable (`NO_RESERVATION`).
   js-libp2p's listener renews on its own, but only on a connection the
-  router still holds the admission of; the JS SDK runs the handshake again
-  on every new connection to a router and, when the relayed address is
-  gone, authenticates and reserves again within thirty seconds. The Python
+  router still holds the admission of, and does not reserve again on a
+  static relay after the connection dropped
+  ([libp2p/js-libp2p#3601](https://github.com/libp2p/js-libp2p/issues/3601));
+  the JS SDK runs the handshake again on every new connection to a router
+  and, when the relayed address is gone, authenticates and reserves again
+  within thirty seconds. The Python
   SDK renews two minutes before the expiry the router returned, and within
   thirty seconds of the connection to that router going, running the auth
   handshake again first.
@@ -137,7 +141,7 @@ pinned by a test:
   ID is case-sensitive. The URL an HTTP client uses for a peer's service
   therefore carries the peer ID in the path,
   `http://mesh/sam/<peer-id>/<type>/<name>/<path>`, the shape of `sam-node`'s
-  egress proxy and of an agent card it rewrote; the host is ignored.
+  egress proxy and of an agent card rewritten for the mesh; the host is ignored.
 - A member that publishes nothing has announced no address, so nothing in
   the DHT or a router's peerstore names one. `sam-node` dials
   `/p2p/<router>/p2p-circuit` for every router it authenticated with when
@@ -459,14 +463,26 @@ holds against the control plane's records.
   multiaddr is dialed as given.
 - `/sam/mcp/1.0.0` client: `session.openMCP(peer, "mcp://<name>")` sends
   the `AuthFrame` naming the service, verifies the provider's credential
-  and the caller's required labels (`checkPeerLabels`: several pairs are
-  met by any one of them, as `api.LabelCheck` joins them with `or`; the
-  conjunction is the operator's egress floor, which only `sam-node` has),
-  then runs the
+  and the caller's required labels (`checkPeerLabels`: every pair must be
+  attested, as `api.LabelCheck` joins them with `,`), then runs the
   official MCP client over the varint-framed stream. JS: a `Transport` for
   `@modelcontextprotocol/sdk`; Python: a pair of memory streams pumped to
   and from the libp2p stream for `mcp.ClientSession`. `""` as the target is
   the provider's own catalog (`list_local_services`, `get_mesh_info`).
+- Egress floor: `join({ egressRequireLabels })` (`join(egress_require_labels=)`)
+  is `sam-node`'s `egress.require_labels` for an SDK member: every provider
+  the session calls must attest all of them, on top of a call's required
+  labels, on every outbound call however the peer was named, MCP and HTTP
+  alike. It is the same rule as the caller's requirement (`api.LabelCheck`),
+  checked separately so no call can reach it. Stated once at join and held
+  for the session; a call cannot waive or widen it. The three
+  implementations agree on it, as they do on the caller's requirement. The
+  HTTP path (`request`, `fetch`, `MeshTransport`) verifies the provider with
+  or without a floor, through the mutual `/sam/auth/1.0.0` handshake, as
+  `sam-node`'s `VerifyPeerLabels` does before its egress proxy sends
+  anything; a positive verdict is kept per peer for five minutes
+  (`labelGateTTL`); a refusal is not kept. An unmet floor is a
+  `LabelsNotSatisfiedError` naming the floor.
 - `session.listTools(peer, service)` and `session.callTool(peer, service,
   tool, args)` on top of that.
 - Tests. Unit: each SDK calls a tool on an in-process provider that serves
@@ -504,7 +520,13 @@ holds against the control plane's records.
   `open_http_request` / `fetchOverStream` return once the headers are in
   and stream the body; `MeshTransport` (httpx) and `session.fetch()`
   (fetch) carry a client's requests to the peer a mesh URL names. The A2A
-  SDK's client takes either without changes.
+  SDK's client takes either without changes. The card of an agent behind a
+  `sam-node` names the agent's own address; a GET of the well-known card
+  path or of the service root is answered the way the node's egress proxy
+  answers it: the SDK fetches the card itself, with identity encoding, and
+  serves it rewritten (`rewriteAgentCard` / `rewrite_agent_card`): HTTP
+  interfaces point at the mesh URL, gRPC ones are dropped, signatures go.
+  Streaming stays as the agent declares it, since the transport streams.
 - `sam-node`: a peer it knows no address for is dialed through every
   router it authenticated with, so its egress proxy reaches an agent by
   peer ID (`preparePeerAddrs`).

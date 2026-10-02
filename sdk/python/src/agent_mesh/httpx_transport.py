@@ -20,9 +20,11 @@ libp2p:
     await client.post("http://mesh/sam/<peer-id>/a2a/agent", json=...)
 
 The URL has the shape sam-node's egress proxy takes, /sam/<peer-id>/<type>/
-<name>/<path>, so an agent card a sam-node rewrote for the mesh works here as
-it is. The host is ignored: httpx lowercases it, and a peer ID is not
-case-insensitive. Response bodies stream, so `message/stream` works."""
+<name>/<path>. The card of an agent behind a sam-node comes back rewritten to
+that shape, as the node's egress proxy serves it, so a stock A2A client
+bootstraps from it unchanged. The host is ignored: httpx lowercases it, and a
+peer ID is not case-insensitive. Response bodies stream, so `message/stream`
+works."""
 
 from __future__ import annotations
 
@@ -30,12 +32,11 @@ from typing import TYPE_CHECKING, AsyncIterator
 
 import httpx
 
-from .libp2p_http import StreamedResponse, open_http_request
+from .libp2p_http import MESH_PATH_PREFIX, StreamedResponse, open_http_request
 
 if TYPE_CHECKING:
     from .session import MeshSession
 
-MESH_PATH_PREFIX = "/sam/"
 _REQUEST_TIMEOUT = 60.0
 
 
@@ -77,7 +78,7 @@ class MeshTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         peer_text, target = split_mesh_url(request.url)
-        peer_id = await self._session.connect(peer_text)
+        peer_id = await self._session._egress_peer(peer_text)  # noqa: SLF001 - the session's verified egress path, not a caller option
         body = await request.aread()
         headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in request.headers.raw}
         response = await open_http_request(

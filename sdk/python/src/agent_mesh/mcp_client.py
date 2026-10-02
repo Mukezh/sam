@@ -34,7 +34,8 @@ from mcp.shared.message import SessionMessage
 
 from ._proto import sam_pb2 as pb
 from .auth import AUTH_HANDSHAKE_TIMEOUT, MAX_AUTH_FRAME_BYTES, MCP_PROTOCOL, AuthRejectedError
-from .biscuit import BiscuitVerificationError, VerifiedBiscuit, verify_peer_biscuit
+from .biscuit import BiscuitVerificationError, VerifiedBiscuit, require_role, verify_peer_biscuit
+from .controlplane import ROLE_NODE
 from .host import open_stream
 
 logger = logging.getLogger("agent_mesh")
@@ -46,22 +47,32 @@ MCP_CLIENT_INFO = mcp_types.Implementation(name="agent-mesh-sdk", version="0.1.0
 
 
 class LabelsNotSatisfiedError(Exception):
-    """The provider's credential carries none of the labels the caller requires (checkPeerLabels)."""
+    """The provider's credential lacks a label the caller requires or a label
+    of the session's egress floor, as checkPeerLabels refuses."""
 
-    def __init__(self, peer_id: str, required: Sequence[str]):
-        super().__init__(f"peer {peer_id} carries none of the required labels: {', '.join(required)}")
+    def __init__(self, peer_id: str, required: Sequence[str], what: str):
+        super().__init__(f"peer {peer_id} {what}: {', '.join(required)}")
+
+
+def _require_every_pair(provider: VerifiedBiscuit, required: Optional[Mapping[str, str]], what: str) -> None:
+    if not required or all(provider.labels.get(k) == v for k, v in required.items()):
+        return
+    raise LabelsNotSatisfiedError(provider.peer_id, [f"{k}={v}" for k, v in required.items()], what)
 
 
 def require_labels(provider: VerifiedBiscuit, required: Optional[Mapping[str, str]]) -> None:
-    """A caller's requirement is satisfied by any one pair, as sam-node's
-    api.LabelCheck (`check if label(k1, v1) or label(k2, v2)`): several pairs
-    mean "any of these will do". The operator's egress floor is the
-    conjunction, and sam-node's alone."""
-    if not required:
-        return
-    if any(provider.labels.get(k) == v for k, v in required.items()):
-        return
-    raise LabelsNotSatisfiedError(provider.peer_id, [f"{k}={v}" for k, v in required.items()])
+    """A requirement is satisfied only when the provider attests every pair, as
+    sam-node's api.LabelCheck (`check if label(k1, v1), label(k2, v2)`), the
+    same rule as the egress floor. A map holds one value per key, so listing
+    several pairs narrows the acceptable providers. Empty is no requirement."""
+    _require_every_pair(provider, required, "does not attest every required label")
+
+
+def require_egress_labels(provider: VerifiedBiscuit, required: Optional[Mapping[str, str]]) -> None:
+    """The session's egress floor, sam-node's egress.require_labels: the same
+    rule as require_labels, refused with a message that names the floor. Empty
+    is no floor."""
+    _require_every_pair(provider, required, "does not attest the egress floor")
 
 
 @dataclass
@@ -97,10 +108,12 @@ async def open_mcp_session(
     trusted_keys: Sequence[bytes],
     *,
     required_labels: Optional[Mapping[str, str]] = None,
+    egress_require_labels: Optional[Mapping[str, str]] = None,
 ) -> AsyncIterator[tuple[ClientSession, VerifiedBiscuit]]:
     """Opens /sam/mcp/1.0.0 to a connected provider with `frame`, this member's
     AuthFrame naming the service, verifies the provider and yields an
-    initialized MCP ClientSession with the provider's credential."""
+    initialized MCP ClientSession with the provider's credential; egress_require_labels
+    is the session's, not the caller's (require_egress_labels)."""
     stream = await open_stream(host, peer_id, MCP_PROTOCOL, AUTH_HANDSHAKE_TIMEOUT)
     try:
         with trio.fail_after(AUTH_HANDSHAKE_TIMEOUT):
@@ -113,9 +126,12 @@ async def open_mcp_session(
             raise AuthRejectedError(str(peer_id), resp.error or "no reason given")
         try:
             provider = verify_peer_biscuit(resp.biscuit, str(peer_id), trusted_keys)
+            # Only nodes host services; a router's or an admin's credential is a member, not a provider.
+            require_role(provider, ROLE_NODE)
         except BiscuitVerificationError as err:
             raise AuthRejectedError(str(peer_id), f"provider credential rejected: {err}") from err
         require_labels(provider, required_labels)
+        require_egress_labels(provider, egress_require_labels)
     except trio.TooSlowError as err:
         await stream.close()
         raise AuthRejectedError(str(peer_id), "handshake timed out") from err

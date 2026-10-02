@@ -43,10 +43,11 @@ export { BiscuitVerificationError, ROLE_ROUTER, requireRole, verifyPeerBiscuit, 
 export { AUTH_HANDLER_OPTIONS, AUTH_PROTOCOL, MCP_PROTOCOL, AuthRejectedError, authenticateWithPeer, authStreamHandler } from "./auth.ts";
 export { createMeshHost, type MeshHost, type MeshHostOptions } from "./host.ts";
 export { DHT_PROTOCOL, isServiceType, parseServiceTarget, serviceCID, type ServiceType } from "./discovery.ts";
-export { LabelsNotSatisfiedError, StreamTransport, openMCPSession, requireLabels, type MCPSession, type MCPSessionOptions } from "./mcp.ts";
+export { LabelsNotSatisfiedError, StreamTransport, openMCPSession, requireEgressLabels, requireLabels, type MCPSession, type MCPSessionOptions } from "./mcp.ts";
 export { AuthorizationError, authorizeCaller, type AuthorizeRequest, type ProviderAuthorizerOptions } from "./authorizer.ts";
 export {
   DEFAULT_A2A_NAME,
+  AGENT_CARD_PATH,
   HTTP_HANDLER_OPTIONS,
   HTTP_PROTOCOL,
   MESH_PATH_PREFIX,
@@ -57,6 +58,7 @@ export {
   httpRequestOverStream,
   meshHTTPTarget,
   meshURL,
+  rewriteAgentCard,
   splitMeshURL,
   type A2AEndpoint,
   type A2AEndpointSpec,

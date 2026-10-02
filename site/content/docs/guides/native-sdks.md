@@ -465,6 +465,10 @@ plug the mesh in as its transport.
   agent card, and what an A2A client on the mesh is given. The peer ID is in
   the path because URL parsers lowercase the host and a peer ID is
   case-sensitive.
+- An agent behind a `sam-node` serves a card naming its own address. The
+  SDK hands the client that card rewritten for the mesh, as `sam-node`'s
+  egress proxy does, so a stock A2A client given the mesh URL bootstraps
+  from it unchanged.
 - The A2A JavaScript SDK takes a `fetch` for its client and mounts its server
   as Express handlers. `session.fetch()` is the fetch;
   `acceptA2A({ listener: app })` runs the Express app on the mesh, with
@@ -884,8 +888,14 @@ through every router that admitted the caller, and the router opens a
 circuit because it admitted the agent too. Either way the SDK verifies the
 peer's credential before sending anything, and `requiredLabels`
 (`required_labels` in Python) refuses a peer whose control-plane-attested
-labels carry none of the pairs you ask for; one matching pair is enough,
-as with `X-Sam-Required-Labels` on a `sam-node`.
+labels do not carry every pair you ask for, as `X-Sam-Required-Labels` does
+on a `sam-node`. A floor uses the same rule for the whole session:
+`join({ egressRequireLabels })` (`join(egress_require_labels=)`) names
+labels every peer the session calls must attest, as `egress.require_labels`
+does for a `sam-node`. It is stated once at `join` and held for the
+session, on every call and however the peer was named; the agent's calls
+cannot waive or widen it. The floor belongs to the program that calls
+`join`; no configuration outside the process sets it.
 
 `acceptA2A` (`accept_a2a`) fetched the mesh policy and started answering.
 Every caller must present a credential signed by a trusted control plane

@@ -30,7 +30,7 @@ proxy path does not accept it there.
 |---|---|---|
 | `GET /healthz`, `GET /readyz` | none | `200` while the process is up. Every other route except `/debug/*` answers `503` until the node is connected to the mesh, so a `503` on `/mcp` is the practical readiness signal. |
 | `GET /metrics` | token | Prometheus metrics (`sam_node_*`). |
-| `POST /mcp` | token | The MCP server (Streamable HTTP). `/` is an alias. |
+| `POST /mcp` | token | The MCP server (Streamable HTTP, sessionless: no `Mcp-Session-Id`, `GET` answers `405`). `/` is an alias. |
 | `GET /v1/models` | token | Models served by every reachable inference provider. |
 | `POST /v1/chat/completions`, `POST /v1/completions` | token | OpenAI-compatible inference, routed to a provider of the requested model. |
 | `GET /sam/service/discover` | token | Discover services on the mesh. |
@@ -108,7 +108,7 @@ Returns `description`, `input_schema` and `output_schema`.
 | `peer_id` | Required. |
 | `tool_name` | Required, namespaced. |
 | `arguments` | Object matching the tool's `input_schema`. |
-| `required_labels` | `key=value[,key=value]`. The call is refused unless the peer's credential attests at least one of them. |
+| `required_labels` | `key=value[,key=value]`. The call is refused unless the peer's credential attests every one of them. |
 
 Returns the tool's result content. A policy denial comes back as a tool
 error that the caller can read, not as a transport failure.
@@ -146,7 +146,7 @@ Two headers modify a proxied request:
 
 | Header | Effect |
 |---|---|
-| `X-Sam-Required-Labels: k=v[,k=v]` | Verify that the peer attests at least one of the pairs before forwarding. Otherwise `403`. Removed before forwarding. Also honoured on `/v1/*`. |
+| `X-Sam-Required-Labels: k=v[,k=v]` | Forward only to a peer whose credential attests every listed pair. Otherwise `403`. Removed before forwarding. Also honoured on `/v1/*`. |
 | `X-Sam-Agent: <agent-id>` | Name the agent for which this request is made. Only meaningful when sent by a `sam-box`. See the [preview](../../preview/sandboxed-agents/). |
 
 ### Talking MCP through the proxy
@@ -181,6 +181,18 @@ itself, so a stock client sends `message/send` there without changes:
 ```bash
 curl -s --unix-socket $SOCK \
   http://localhost/sam/<peer-id>/a2a/triage/.well-known/agent-card.json
+```
+
+The official [`a2a` CLI](https://github.com/a2aproject/a2a-cli) (v0.3.0 or
+later) is such a client. It speaks TCP only, so the token travels as a
+service parameter, set through the environment to keep it off the command
+line; `X-Sam-Required-Labels` goes in the same variable, comma-separated:
+
+```bash
+CARD=http://127.0.0.1:8080/sam/<peer-id>/a2a/triage/.well-known/agent-card.json
+export A2ACLI_SVC_PARAM="X-Sam-Authentication=Bearer $TOKEN"
+a2a card get $CARD
+a2a send -a $CARD "hello"
 ```
 
 ## Inference

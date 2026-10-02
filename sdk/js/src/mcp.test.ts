@@ -31,12 +31,12 @@ import { readFileSync } from "node:fs";
 import { after, before, test } from "node:test";
 import { z } from "zod";
 import { AuthRejectedError, MAX_AUTH_FRAME_BYTES, MCP_PROTOCOL } from "./auth.ts";
-import { loadBiscuit, verifyPeerBiscuit } from "./biscuit.ts";
+import { ROLE_ROUTER, loadBiscuit, verifyPeerBiscuit } from "./biscuit.ts";
 import { ROLE_NODE } from "./controlplane.ts";
 import { parseServiceTarget, serviceCID } from "./discovery.ts";
 import { AuthFrameSchema, AuthResponseSchema } from "./gen/sam_pb.ts";
 import { Identity } from "./identity.ts";
-import { LabelsNotSatisfiedError, StreamTransport, openMCPSession, requireLabels } from "./mcp.ts";
+import { LabelsNotSatisfiedError, StreamTransport, openMCPSession, requireEgressLabels, requireLabels } from "./mcp.ts";
 
 type Wasm = Awaited<ReturnType<typeof loadBiscuit>>;
 
@@ -169,21 +169,48 @@ test("required labels are checked on the provider's credential", async () => {
   assert.throws(() => requireLabels({ peerId: "p", expiration: new Date(), verifyingKey: cpKey, roles: [], labels: {} }, { team: "x" }), /team=x/);
 });
 
-test("a requirement of several labels is met by any one of them, as sam-node's checkPeerLabels", () => {
+test("a requirement of several labels is met only by every one of them, as sam-node's checkPeerLabels", () => {
   // The cases of internal/node/labels_gate_test.go, run through the SDK's predicate.
   const attesting = (labels: Record<string, string>) => ({ peerId: "p", expiration: new Date(), verifyingKey: cpKey, roles: [], labels });
   // exact match
   requireLabels(attesting({ region: "us-east-1" }), { region: "us-east-1" });
-  // any-of requirement matches one key
-  requireLabels(attesting({ region: "na-us", team: "platform" }), { region: "eu", team: "platform" });
+  // every pair of two attested
+  requireLabels(attesting({ region: "na-us", team: "platform" }), { region: "na-us", team: "platform" });
+  // one pair of two wrong fails, naming the whole requirement
+  assert.throws(() => requireLabels(attesting({ region: "na-us", team: "platform" }), { region: "eu", team: "platform" }), /does not attest every required label: region=eu, team=platform/);
+  // one pair of two missing fails
+  assert.throws(() => requireLabels(attesting({ region: "na-us" }), { region: "na-us", team: "platform" }), LabelsNotSatisfiedError);
   // no built-in hierarchy: coarser requirement fails a finer claim
   assert.throws(() => requireLabels(attesting({ region: "us-east-1" }), { region: "us" }), LabelsNotSatisfiedError);
   // disjoint labels fail
   assert.throws(() => requireLabels(attesting({ region: "na-us" }), { region: "eu" }), LabelsNotSatisfiedError);
-  // unattested token fails closed, naming every pair the caller asked for
-  assert.throws(() => requireLabels(attesting({}), { region: "eu", team: "platform" }), /region=eu, team=platform/);
+  // unattested token fails closed
+  assert.throws(() => requireLabels(attesting({}), { region: "eu", team: "platform" }), LabelsNotSatisfiedError);
   // an empty requirement is no requirement
   requireLabels(attesting({}), {});
+  requireLabels(attesting({}), undefined);
+});
+
+test("the egress floor is met only by every one of its pairs, as sam-node's api.LabelCheck", () => {
+  const attesting = (labels: Record<string, string>) => ({ peerId: "p", expiration: new Date(), verifyingKey: cpKey, roles: [], labels });
+  requireEgressLabels(attesting({ region: "eu", team: "platform" }), { region: "eu" });
+  requireEgressLabels(attesting({ region: "eu", team: "platform" }), { region: "eu", team: "platform" });
+  // one pair short is a refusal that names the whole floor
+  assert.throws(() => requireEgressLabels(attesting({ region: "eu" }), { region: "eu", team: "platform" }), /peer p does not attest the egress floor: region=eu, team=platform/);
+  assert.throws(() => requireEgressLabels(attesting({ region: "us" }), { region: "eu" }), LabelsNotSatisfiedError);
+  // no floor is no floor
+  requireEgressLabels(attesting({}), {});
+  requireEgressLabels(attesting({}), undefined);
+});
+
+test("the egress floor is held on the MCP path beside the caller's requirement", async () => {
+  const conn = await caller.dial(provider.getMultiaddrs()[0] as Parameters<typeof caller.dial>[0]);
+  const ok = await openMCPSession(conn, frame("mcp://calc"), [cpKey], {}, { region: "eu" });
+  await ok.close();
+  await assert.rejects(openMCPSession(conn, frame("mcp://calc"), [cpKey], {}, { region: "eu", team: "platform" }), LabelsNotSatisfiedError);
+  // Both apply when both are set: neither one's pairs stand in for the other's.
+  await assert.rejects(openMCPSession(conn, frame("mcp://calc"), [cpKey], { requiredLabels: { region: "eu" } }, { team: "platform" }), LabelsNotSatisfiedError);
+  await assert.rejects(openMCPSession(conn, frame("mcp://calc"), [cpKey], { requiredLabels: { team: "platform" } }, { region: "eu" }), LabelsNotSatisfiedError);
 });
 
 test("a caller the provider cannot verify gets no session", async () => {
@@ -205,4 +232,16 @@ test("a provider whose credential the caller does not trust is rejected", async 
 test("a service the provider does not have ends the session before MCP starts", async () => {
   const conn = await caller.dial(provider.getMultiaddrs()[0] as Parameters<typeof caller.dial>[0]);
   await assert.rejects(openMCPSession(conn, frame("mcp://no-such-service"), [cpKey], { signal: AbortSignal.timeout(3000) }));
+});
+
+test("only a node is a provider, as sam-node's checkPeerLabels requires", async () => {
+  // The provider answers with the credential it holds at the time; a router's, attesting the floor, is not a provider's.
+  const nodeBiscuit = providerBiscuit;
+  providerBiscuit = mint(provider.peerId.toString(), ROLE_ROUTER, { region: "eu" });
+  try {
+    const conn = await caller.dial(provider.getMultiaddrs()[0] as Parameters<typeof caller.dial>[0]);
+    await assert.rejects(openMCPSession(conn, frame("mcp://calc"), [cpKey], {}, { region: "eu" }), /lacks expected role "sam:role:node"/);
+  } finally {
+    providerBiscuit = nodeBiscuit;
+  }
 });

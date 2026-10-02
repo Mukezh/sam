@@ -19,10 +19,11 @@ import { peerIdFromString } from "@libp2p/peer-id";
 import { isMultiaddr, multiaddr, type Multiaddr } from "@multiformats/multiaddr";
 import { AUTH_HANDLER_OPTIONS, AUTH_PROTOCOL, authenticateWithPeer, authStreamHandler } from "./auth.ts";
 import { ROLE_ROUTER, requireRole, type VerifiedBiscuit } from "./biscuit.ts";
+import { ROLE_NODE } from "./controlplane.ts";
 import { canonicalPeerId } from "./identity.ts";
 import { isServiceType, parseServiceTarget, serviceCID } from "./discovery.ts";
 import { createMeshHost, listenThroughRelay, type MeshHost, type MeshHostOptions, type RelayListener } from "./host.ts";
-import { openMCPSession, type MCPSession, type MCPSessionOptions } from "./mcp.ts";
+import { openMCPSession, requireEgressLabels, type MCPSession, type MCPSessionOptions } from "./mcp.ts";
 import type { AgentMesh, ControlPlaneSync } from "./mesh.ts";
 import {
   HTTP_HANDLER_OPTIONS,
@@ -75,6 +76,12 @@ export interface JoinOptions extends MeshHostOptions {
    * how long the member is unreachable at most before it reserves again.
    */
   relayCheckIntervalMs?: number;
+  /**
+   * sam-node's egress.require_labels for an SDK member: every provider this
+   * session calls must attest all of these pairs, on top of a call's
+   * requiredLabels. Held on every call, MCP and HTTP alike; no call waives it.
+   */
+  egressRequireLabels?: Record<string, string>;
   /** Bounds the whole join. */
   signal?: AbortSignal;
 }
@@ -132,6 +139,8 @@ const DEFAULT_CONTROL_PLANE_SYNC_MS = 15 * 60 * 1000;
 const FIRST_CONTROL_PLANE_SYNC_MS = 2_000;
 const DEFAULT_CONTROL_PLANE_SYNC_JITTER_MS = 2_000;
 const DEFAULT_RELAY_CHECK_MS = 30 * 1000;
+/** How long a provider's positive egress verdict is kept; sam-node's labelGateTTL. */
+const EGRESS_VERDICT_TTL_MS = 5 * 60 * 1000;
 
 /**
  * A member that is on the mesh: a libp2p host authenticated with at least
@@ -161,6 +170,9 @@ export class MeshSession {
   readonly #syncIntervalMs: number;
   readonly #syncJitterMs: number;
   #policyRules: string[] | undefined;
+  readonly #egressRequireLabels: Record<string, string> | undefined;
+  /** Peers verified as enrolled and holding the floor, until when; misses are never kept. */
+  readonly #egressVerdicts = new Map<string, Date>();
   #closed = false;
 
   constructor(mesh: AgentMesh, node: MeshHost, routers: AdmittedRouter[], authenticatedPeers: Map<string, Date>, banned: BanSet, options: JoinOptions, relayListener?: RelayListener) {
@@ -175,6 +187,7 @@ export class MeshSession {
     this.#policySyncMs = options.policySyncIntervalMs ?? DEFAULT_POLICY_SYNC_MS;
     this.#syncIntervalMs = options.controlPlaneSyncIntervalMs ?? DEFAULT_CONTROL_PLANE_SYNC_MS;
     this.#syncJitterMs = options.controlPlaneSyncJitterMs ?? DEFAULT_CONTROL_PLANE_SYNC_JITTER_MS;
+    this.#egressRequireLabels = options.egressRequireLabels;
     this.#scheduleRefresh();
     this.#listenForEvents();
     this.#keepRouterAdmissions();
@@ -236,9 +249,13 @@ export class MeshSession {
    * at join: a router that restarted or trimmed the connection dropped it
    * and with it the relayed address peers reach this member on. Routers are
    * tried in order, each dialed and authenticated again first, since the
-   * router forgot the admission with the connection. Runs on
-   * relayCheckIntervalMs; exposed so a caller can force it. Concurrent
-   * calls share one attempt.
+   * router forgot the admission with the connection. A router rescheduled
+   * keeps its key and comes back on another address; the list the control
+   * plane hands out, refreshed by every pull, names the current one, so the
+   * router is dialed at what that list says and keeps the address the
+   * connection was made on. Runs on relayCheckIntervalMs; exposed so a
+   * caller can force it. Concurrent calls share one attempt. Upstream:
+   * libp2p/js-libp2p#3601.
    */
   keepRelay(): Promise<void> {
     this.#keepingRelay ??= this.#keepRelayOnce().finally(() => {
@@ -252,11 +269,14 @@ export class MeshSession {
       return;
     }
     const failures: string[] = [];
-    for (const r of this.routers) {
+    for (const [i, r] of this.routers.entries()) {
+      const listed = this.mesh.credential.routerAddresses.map((a) => multiaddr(a)).filter((ma) => targetPeerOf(ma) === r.peerId);
       try {
-        const conn = await this.node.dial(r.addr);
+        const conn = await this.node.dial(listed.length > 0 ? listed : r.addr);
         await authenticateWithPeer(conn, this.mesh.authFrame(), this.mesh.credential.controlPlaneKeys);
-        await this.#relayListener.listen(r.addr.encapsulate("/p2p-circuit"));
+        const addr = connectedAddress(conn, r.peerId);
+        this.routers[i] = { ...r, addr };
+        await this.#relayListener.listen(addr.encapsulate("/p2p-circuit"));
         return;
       } catch (err) {
         failures.push(`${r.peerId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -458,7 +478,7 @@ export class MeshSession {
    */
   async openMCP(peer: Peer, targetService: string, options: MCPSessionOptions = {}): Promise<MCPSession> {
     const conn = await this.connect(peer, options.signal);
-    return openMCPSession(conn, this.mesh.authFrame(targetService, options.agent ?? ""), this.mesh.credential.controlPlaneKeys, options);
+    return openMCPSession(conn, this.mesh.authFrame(targetService, options.agent ?? ""), this.mesh.credential.controlPlaneKeys, options, this.#egressRequireLabels);
   }
 
   /** Lists the tools a provider serves for a service. */
@@ -619,8 +639,27 @@ export class MeshSession {
    * way sam-node's egress proxy does for /sam/<peer>/<type>/<name>/<path>.
    */
   async request(peer: Peer, targetService: string, path: string, options: HTTPRequestOptions = {}): Promise<HTTPResponse> {
-    const conn = await this.connect(peer, options.signal);
+    const conn = await this.#egressConnection(peer, options.signal);
     return httpRequestOverStream(conn, this.mesh.credential.biscuit, targetService, path, options);
+  }
+
+  /**
+   * The connection an HTTP call goes out on, its peer verified as an enrolled
+   * node holding the floor before anything is sent (sam-node's VerifyPeerLabels).
+   */
+  async #egressConnection(peer: Peer, signal?: AbortSignal): Promise<Connection> {
+    const conn = await this.connect(peer, signal);
+    const peerId = conn.remotePeer.toString();
+    const until = this.#egressVerdicts.get(peerId);
+    if (until !== undefined && until.getTime() > Date.now()) {
+      return conn;
+    }
+    const provider = await authenticateWithPeer(conn, this.mesh.authFrame(), this.mesh.credential.controlPlaneKeys);
+    // Only nodes host services; a router's or an admin's credential is a member, not a provider.
+    requireRole(provider, ROLE_NODE);
+    requireEgressLabels(provider, this.#egressRequireLabels);
+    this.#egressVerdicts.set(peerId, new Date(Date.now() + EGRESS_VERDICT_TTL_MS));
+    return conn;
   }
 
   /**
@@ -633,7 +672,7 @@ export class MeshSession {
     return async (input, init) => {
       const request = new Request(input, init);
       const { peerId } = splitMeshURL(new URL(request.url));
-      const conn = await this.connect(peerId, request.signal);
+      const conn = await this.#egressConnection(peerId, request.signal);
       const streamOptions: { agent?: string; signal?: AbortSignal } = {};
       if (options.agent !== undefined) {
         streamOptions.agent = options.agent;
@@ -711,6 +750,17 @@ export class MeshSession {
 
 /** Implements AgentMesh.join(); lives here to keep mesh.ts free of libp2p. */
 export async function joinMesh(mesh: AgentMesh, options: JoinOptions = {}): Promise<MeshSession> {
+  // The pull sam-node makes before it starts: a member resuming from its
+  // state directory after a key rotation would otherwise verify the routers,
+  // which already hold credentials under the new key, against the keys it
+  // persisted, and the sync that would have brought the new key runs only
+  // once joined. Best effort; the stored credential serves when the control
+  // plane cannot be reached.
+  try {
+    await mesh.syncControlPlane();
+  } catch {
+    // Joining goes on with what the credential holds.
+  }
   const routerAddrs = (options.routerAddresses ?? mesh.credential.routerAddresses).map((a) => multiaddr(a));
   if (routerAddrs.length === 0) {
     throw new Error(options.routerAddresses === undefined ? "credential lists no router addresses; the control plane had no active router at enrollment" : "routerAddresses names no router");

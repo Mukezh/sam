@@ -78,6 +78,25 @@ function emit(obj: unknown): void {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
+/**
+ * Labels from an environment variable written "k=v,k2=v2"; a pair without
+ * "=" is refused (parseRequiredLabels), so a typo never switches a floor off.
+ */
+function labelsFromEnv(name: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const pair of (process.env[name] ?? "").split(",")) {
+    if (pair.trim() === "") {
+      continue;
+    }
+    const eq = pair.indexOf("=");
+    if (eq === -1) {
+      throw new Error(`${name}: invalid label ${JSON.stringify(pair.trim())}: expected key=value`);
+    }
+    out[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+  }
+  return out;
+}
+
 function failure(cmd: string | undefined, err: unknown): unknown {
   return { cmd, ok: false, error: err instanceof Error ? `${err.name}: ${err.message}` : String(err) };
 }
@@ -172,14 +191,16 @@ async function main(): Promise<void> {
   const stateDir = requireEnv("SAM_SDK_STATE_DIR");
   const allowInsecure = process.env.SAM_INSECURE_CONTROL_PLANE === "1";
   const listenAddrs = (process.env.SAM_SDK_LISTEN_ADDRS ?? "").split(",").filter((a) => a !== "");
-  // Labels this member declares at enrollment, "k=v,k2=v2"; the policy's
-  // allowed_labels decide whether the control plane attests them.
-  const labels = Object.fromEntries(
-    (process.env.SAM_SDK_LABELS ?? "")
-      .split(",")
-      .filter((pair) => pair.includes("="))
-      .map((pair) => pair.split("=", 2) as [string, string]),
-  );
+  // Labels this member declares at enrollment; the policy's allowed_labels
+  // decide whether the control plane attests them. SAM_SDK_EGRESS_REQUIRE_LABELS
+  // is the floor every provider this member calls must attest.
+  const labels = labelsFromEnv("SAM_SDK_LABELS");
+  const egressRequireLabels = labelsFromEnv("SAM_SDK_EGRESS_REQUIRE_LABELS");
+  // SAM_SDK_RELAY_CHECK_SECONDS shortens how often the relay reservation is
+  // checked, so a test that moves a router sees the member follow it within
+  // its budget.
+  const relayCheck = process.env.SAM_SDK_RELAY_CHECK_SECONDS;
+  const relayOptions = relayCheck !== undefined && relayCheck !== "" ? { relayCheckIntervalMs: Number(relayCheck) * 1000 } : {};
 
   const mesh = await AgentMesh.enroll({
     controlPlaneUrl,
@@ -197,6 +218,8 @@ async function main(): Promise<void> {
   const session = await mesh.join({
     listenAddrs,
     ...(routerAddresses !== undefined ? { routerAddresses } : {}),
+    ...(Object.keys(egressRequireLabels).length > 0 ? { egressRequireLabels } : {}),
+    ...relayOptions,
     signal: AbortSignal.timeout(20_000),
     controlPlaneSyncIntervalMs: 0,
     controlPlaneSyncJitterMs: 0,

@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,6 +49,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	circuitpb "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/pb"
+	circuitproto "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
+	circuitutil "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/util"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-msgio"
 	"github.com/multiformats/go-multiaddr"
@@ -83,9 +87,9 @@ type sdkMesh struct {
 }
 
 // sdkMeshLabels is what every provider in the mesh attests, the node and the
-// SDK members alike: the inputs of the "any-of requirement matches one key"
-// case of internal/node/labels_gate_test.go, so the caller-side check can be
-// run against a real credential from every implementation.
+// SDK members alike: the inputs of the "one pair of two wrong fails" case of
+// internal/node/labels_gate_test.go, so the caller-side check can be run
+// against a real credential from every implementation.
 var sdkMeshLabels = map[string]string{"region": "na-us", "team": "platform"}
 
 // The egress destination the sam-node serves, assigned to it by label, and
@@ -96,17 +100,17 @@ const (
 )
 
 // sdkMeshLabelRequirements are the caller requirements the matrix runs against
-// sdkMeshLabels: one pair of two matches, so a requirement is met by any of its
-// pairs (api.LabelCheck joins them with `or`); none of the pairs matches, so
-// it is refused; one pair that matches; the coarser value of a finer claim, so
-// there is no hierarchy.
+// sdkMeshLabels: both pairs attested, so a requirement of several pairs is
+// met; one pair of two wrong, so it is refused (api.LabelCheck joins them with
+// `,`); one pair that matches; the coarser value of a finer claim, so there is
+// no hierarchy.
 var sdkMeshLabelRequirements = []struct {
 	name     string
 	required map[string]string
 	allowed  bool
 }{
-	{"any-of requirement matches one key", map[string]string{"region": "eu", "team": "platform"}, true},
-	{"disjoint labels fail", map[string]string{"region": "eu", "team": "sre"}, false},
+	{"every pair attested", map[string]string{"region": "na-us", "team": "platform"}, true},
+	{"one pair of two wrong fails", map[string]string{"region": "eu", "team": "platform"}, false},
 	{"exact match", map[string]string{"team": "platform"}, true},
 	{"no built-in hierarchy", map[string]string{"region": "na"}, false},
 }
@@ -208,6 +212,16 @@ egress:
 	// serving the MCP service "calc" from a backend this test runs.
 	backend := httptest.NewServer(newBoundaryMCPHandler(t))
 	t.Cleanup(backend.Close)
+	// A stock A2A agent behind the node; its card names its own address.
+	agentCard := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/agent-card.json" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, sdkMeshStockAgentCard)
+	}))
+	t.Cleanup(agentCard.Close)
 	nodeBin := buildBinary(t, "./cmd/sam-node")
 	nodeHome := filepath.Join(t.TempDir(), "node")
 	if err := os.MkdirAll(nodeHome, 0o755); err != nil {
@@ -228,7 +242,9 @@ egress:
 		"--allow-loopback",
 		"--api-token-path", tokenPath(t, "node-token"),
 		"--discovery-interval", "100ms",
-		"--config", writeNodeConfig(t, nodeHome, sdkMeshLabels, svcDecl{Type: "mcp", Name: "calc", TargetURL: backend.URL}),
+		"--config", writeNodeConfig(t, nodeHome, sdkMeshLabels,
+			svcDecl{Type: "mcp", Name: "calc", TargetURL: backend.URL},
+			svcDecl{Type: "a2a", Name: sdkMeshAgentName, TargetURL: agentCard.URL}),
 		"--secrets-dir", secrets,
 		"--log-level", "debug",
 	)
@@ -254,6 +270,15 @@ egress:
 		mintToken: mintToken,
 	}
 }
+
+const sdkMeshAgentName = "echo-agent"
+
+const sdkMeshStockAgentCard = `{"name":"echo-agent","description":"stock agent behind a sam-node","version":"1.0.0",` +
+	`"capabilities":{"streaming":true},` +
+	`"supportedInterfaces":[{"url":"http://127.0.0.1:7777/","protocolBinding":"JSONRPC","protocolVersion":"1.0"},` +
+	`{"url":"127.0.0.1:50051","protocolBinding":"GRPC","protocolVersion":"1.0"}],` +
+	`"signatures":[{"protected":"eyJhbGciOiJFUzI1NiJ9","signature":"c3RhbGU"}],` +
+	`"skills":[],"defaultInputModes":["text/plain"],"defaultOutputModes":["text/plain"]}`
 
 // sdkMember is a running SDK conformance-join runner: a mesh member written
 // in another language that the test drives over stdin/stdout. Both runners
@@ -464,16 +489,45 @@ func TestNativeSDKsMesh(t *testing.T) {
 			if res := m.callRaw(t, nodeRelayAddr, "mcp://no-such-service", "add", nil); res.OK {
 				t.Fatalf("%s called a service the node does not serve: %+v", m.name, res)
 			}
+
+			// A stock client bootstraps from the node's agent card, so the SDK
+			// serves it rewritten for the mesh, as the node's egress proxy does.
+			res := m.http(t, nodeRelayAddr, "a2a://"+sdkMeshAgentName, "/.well-known/agent-card.json")
+			var card struct {
+				SupportedInterfaces []struct {
+					URL             string `json:"url"`
+					ProtocolBinding string `json:"protocolBinding"`
+				} `json:"supportedInterfaces"`
+				Capabilities struct {
+					Streaming bool `json:"streaming"`
+				} `json:"capabilities"`
+				Signatures []json.RawMessage `json:"signatures"`
+			}
+			if res.Status != 200 || json.Unmarshal([]byte(res.Body), &card) != nil {
+				t.Fatalf("%s fetching the node's agent card: %+v", m.name, res)
+			}
+			meshBase := "http://mesh/sam/" + samNode.peerID.String() + "/a2a/" + sdkMeshAgentName
+			if len(card.SupportedInterfaces) != 1 || card.SupportedInterfaces[0].URL != meshBase || card.SupportedInterfaces[0].ProtocolBinding != "JSONRPC" {
+				t.Errorf("%s got interfaces %+v, want one JSONRPC interface at %s", m.name, card.SupportedInterfaces, meshBase)
+			}
+			// Streaming stays as the agent declares it: the SDK's transport streams.
+			if !card.Capabilities.Streaming || len(card.Signatures) != 0 {
+				t.Errorf("%s got a card with streaming=%v (want true) and %d signatures (want none)", m.name, card.Capabilities.Streaming, len(card.Signatures))
+			}
+			// The bare service root serves the same card, as the node does for a2a-go.
+			if root := m.http(t, nodeRelayAddr, "a2a://"+sdkMeshAgentName, "/"); root.Body != res.Body {
+				t.Errorf("%s got a different card at the service root: %s", m.name, root.Body)
+			}
 		})
 	}
 
 	// The caller-side label requirement means the same thing in every
-	// implementation: a requirement of several pairs is met by any one of
-	// them, none of them is a refusal, and a value is matched whole. The node
-	// and every SDK member attest the same labels, so the matrix below runs
-	// each requirement from each caller against a credential each provider
-	// minted: SDK -> node over /sam/mcp/1.0.0, and node -> SDK through the
-	// egress proxy's X-Sam-Required-Labels, which runs checkPeerLabels.
+	// implementation: a requirement of several pairs is met only when every
+	// one of them is attested, and a value is matched whole. The node and
+	// every SDK member attest the same labels, so the matrix below runs each
+	// requirement from each caller against a credential each provider minted:
+	// SDK -> node over /sam/mcp/1.0.0, and node -> SDK through the egress
+	// proxy's X-Sam-Required-Labels, which runs checkPeerLabels.
 	t.Run("required-labels", func(t *testing.T) {
 		for _, m := range members {
 			if got := m.auth(t, samNode.p2pAddr).Labels; got["region"] != sdkMeshLabels["region"] || got["team"] != sdkMeshLabels["team"] {
@@ -493,6 +547,68 @@ func TestNativeSDKsMesh(t *testing.T) {
 					}
 				}
 			})
+		}
+	})
+
+	// A member whose egress floor nobody attests is refused before anything is
+	// sent, MCP and HTTP alike; the members above carry a floor the mesh does
+	// satisfy (launchSDKMember). MCP to an SDK member fails before the floor: no /sam/mcp.
+	t.Run("egress-floor", func(t *testing.T) {
+		for _, launcher := range sdkMemberLaunchers {
+			cmd, skip := launcher.cmd(root)
+			if skip != "" {
+				continue
+			}
+			floored := launchSDKMember(t, launcher.name+"-floored", cmd, root, baseURL, adminToken, "SAM_SDK_EGRESS_REQUIRE_LABELS=team=nobody")
+			byFloor := func(what, target, err string) {
+				if !strings.Contains(err, "LabelsNotSatisfied") {
+					t.Errorf("%s %s to %s was not refused by the floor: %q", floored.name, what, target, err)
+				}
+			}
+			nodeRelayAddr := samNode.peerID.String()
+			byFloor("tools", "the node", floored.toolsRequiring(t, nodeRelayAddr, "mcp://"+serviceName, nil).Error)
+			byFloor("call", "the node", floored.callRaw(t, nodeRelayAddr, "mcp://"+serviceName, "add", nil).Error)
+			byFloor("http", "the node", floored.httpRaw(t, nodeRelayAddr, "egress://"+sdkMeshEgressHost, "/").Error)
+			for _, m := range members {
+				byFloor("http", m.name, floored.httpRaw(t, m.report.PeerID, "a2a://agent", "/card").Error)
+				if res := floored.toolsRequiring(t, m.report.PeerID, "mcp://"+serviceName, nil); res.OK {
+					t.Errorf("%s listed tools of %s, an SDK member: %v", floored.name, m.name, res.Tools)
+				}
+				if res := floored.callRaw(t, m.report.PeerID, "mcp://"+serviceName, "add", nil); res.OK {
+					t.Errorf("%s called a tool of %s, an SDK member: %+v", floored.name, m.name, res)
+				}
+			}
+			floored.quit(t)
+		}
+	})
+
+	// A relay that accepted the circuit while nobody speaks on the far end,
+	// as a caller sees one whose destination never completes its handshake.
+	// The dial ends at the SDK's dial timeout with an error and the circuit
+	// is let go, in every SDK. Every member dials at once, so this costs the
+	// test one timeout, not one per SDK.
+	t.Run("stalled-relay", func(t *testing.T) {
+		relayAddr, released := startStalledRelay(t)
+		stranger := "12D3KooWA4Xop1JaT3MHxwYMkCepYsv4iPVopMXwCz5iHYdBfeSB"
+		for _, m := range members {
+			m.write(t, map[string]string{"cmd": "auth", "addr": relayAddr + "/p2p-circuit/p2p/" + stranger})
+		}
+		for _, m := range members {
+			var res sdkAuthResult
+			if line := m.readLine(t, 20*time.Second); json.Unmarshal(line, &res) != nil {
+				t.Fatalf("%s member: auth answered %q", m.name, line)
+			}
+			if res.OK {
+				t.Fatalf("%s reached a peer through a relay that delivered nothing", m.name)
+			}
+			t.Logf("%s gave up on the stalled circuit: %s", m.name, res.Error)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for released.Load() < int32(len(members)) && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if got := released.Load(); got != int32(len(members)) {
+			t.Fatalf("%d of %d stalled circuits were let go; the rest are leaked on the relay", got, len(members))
 		}
 	})
 
@@ -805,6 +921,85 @@ func TestNativeSDKsAcrossRouters(t *testing.T) {
 	}
 }
 
+// A router rescheduled keeps its key and comes back on another address. A
+// member that reserved on it advertises a dead relayed address until it
+// reserves again, and it must do so at the router's new address: here a
+// literal one, as sam-one hands out, so there is no name to re-resolve and
+// only the control plane's list, which the member pulls, names it.
+func TestNativeSDKsFollowAMovedRouter(t *testing.T) {
+	mesh := startSDKMesh(t)
+	keys := t.TempDir()
+	routerAddr, stop := startRouter(t, keys, mesh.cpPort, mesh.mintToken, "router-c")
+	router := extractPeerID(routerAddr)
+
+	var members []*sdkMember
+	for _, launcher := range sdkMemberLaunchers {
+		cmd, skip := launcher.cmd(mesh.root)
+		if skip != "" {
+			t.Logf("%s SDK skipped: %s", launcher.name, skip)
+			continue
+		}
+		m := launchSDKMember(t, launcher.name, cmd, mesh.root, mesh.baseURL, mesh.adminToken, "SAM_SDK_ROUTERS="+router, "SAM_SDK_RELAY_CHECK_SECONDS=0.5")
+		if got := routerIDs(m.report); !reflect.DeepEqual(got, []string{router}) {
+			t.Fatalf("%s joined through %v, want %s only", m.name, got, router)
+		}
+		for _, a := range m.report.RelayAddresses {
+			if !strings.HasPrefix(a, routerAddr) {
+				t.Fatalf("%s reserved on %s, want %s", m.name, a, routerAddr)
+			}
+		}
+		m.accept(t, "agent")
+		members = append(members, m)
+	}
+	if len(members) == 0 {
+		t.Skip("no SDK toolchain available; see sdk/README.md")
+	}
+
+	// The same key on another port; the router's lease replaces its address.
+	stop()
+	movedAddr, _ := startRouter(t, keys, mesh.cpPort, mesh.mintToken, "router-c")
+	if extractPeerID(movedAddr) != router || movedAddr == routerAddr {
+		t.Fatalf("router came back as %s, want %s on another port", movedAddr, routerAddr)
+	}
+
+	for _, m := range members {
+		if got := m.sync(t).RouterAddresses; !contains(got, movedAddr) || contains(got, routerAddr) {
+			t.Fatalf("%s pulled routers %v, want %s and not %s", m.name, got, movedAddr, routerAddr)
+		}
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			relayed := m.relayAddresses(t)
+			if len(relayed) > 0 && strings.HasPrefix(relayed[0], movedAddr) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s still advertises %v, want the router at %s", m.name, relayed, movedAddr)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	// A peer that knows the router where it is now reaches each member there.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	goPeer := newAdmittedGoPeer(t, ctx, mesh.cpPriv, []string{movedAddr})
+	for _, m := range members {
+		sdkPeer, err := peer.Decode(m.report.PeerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := goPeer.Connect(ctx, peer.AddrInfo{ID: sdkPeer, Addrs: []multiaddr.Multiaddr{multiaddr.StringCast(m.relayAddresses(t)[0])}}); err != nil {
+			t.Fatalf("go peer could not reach %s through the moved router: %v", m.name, err)
+		}
+		if status, body := libp2pHTTPGet(t, ctx, goPeer, sdkPeer, goHostBiscuit(t, mesh.cpPriv, goPeer.ID()), "/a2a/agent/card"); status != 200 || !strings.Contains(body, goPeer.ID().String()) {
+			t.Fatalf("%s answered %d %s through the moved router", m.name, status, body)
+		}
+	}
+	for _, m := range members {
+		m.quit(t)
+	}
+}
+
 // routerIDs lists the routers a join report says admitted the member.
 func routerIDs(report sdkJoinReport) []string {
 	var ids []string
@@ -848,7 +1043,8 @@ func startSDKMember(t *testing.T, name string, cmd *exec.Cmd, root, baseURL, adm
 }
 
 // launchSDKMember starts a conformance-join runner with a fresh bootstrap
-// token and the labels the matrix uses, plus env, and reads its join report.
+// token, the labels the matrix uses and an egress floor every provider in the
+// mesh satisfies, plus env (a later entry wins), and reads its join report.
 func launchSDKMember(t *testing.T, name string, cmd *exec.Cmd, root, baseURL, adminToken string, env ...string) *sdkMember {
 	t.Helper()
 	tokenPath := filepath.Join(t.TempDir(), "bootstrap.token")
@@ -860,6 +1056,7 @@ func launchSDKMember(t *testing.T, name string, cmd *exec.Cmd, root, baseURL, ad
 		"SAM_BOOTSTRAP_TOKEN_PATH="+tokenPath,
 		"SAM_SDK_STATE_DIR="+filepath.Join(t.TempDir(), "state"),
 		"SAM_SDK_LABELS="+labelsEnv(sdkMeshLabels),
+		"SAM_SDK_EGRESS_REQUIRE_LABELS=region="+sdkMeshLabels["region"],
 	), env...)
 	cmd.Dir = root
 	m := &sdkMember{name: name, cmd: cmd, stderr: &bytes.Buffer{}}
@@ -900,11 +1097,17 @@ func launchSDKMember(t *testing.T, name string, cmd *exec.Cmd, root, baseURL, ad
 
 func (m *sdkMember) send(t *testing.T, command map[string]string) []byte {
 	t.Helper()
+	m.write(t, command)
+	return m.readLine(t, 20*time.Second)
+}
+
+// write sends a command without waiting for its answer; readLine collects it.
+func (m *sdkMember) write(t *testing.T, command map[string]string) {
+	t.Helper()
 	line, _ := json.Marshal(command)
 	if _, err := m.stdin.Write(append(line, '\n')); err != nil {
 		t.Fatalf("%s member: write command: %v", m.name, err)
 	}
-	return m.readLine(t, 20*time.Second)
 }
 
 // authRaw asks the member to connect to addr and run the auth handshake.
@@ -1144,13 +1347,21 @@ type sdkHTTPResult struct {
 	Body   string `json:"body"`
 }
 
-// http asks the member to call an inference or A2A service over /libp2p-http.
-func (m *sdkMember) http(t *testing.T, addr, service, path string) sdkHTTPResult {
+// httpRaw asks the member to call an inference or A2A service over
+// /libp2p-http, and reports a refusal instead of failing.
+func (m *sdkMember) httpRaw(t *testing.T, addr, service, path string) sdkHTTPResult {
 	t.Helper()
 	var res sdkHTTPResult
 	if line := m.send(t, map[string]string{"cmd": "http", "addr": addr, "service": service, "path": path}); json.Unmarshal(line, &res) != nil {
 		t.Fatalf("%s member: http answered %q", m.name, line)
 	}
+	return res
+}
+
+// http is httpRaw that must be answered.
+func (m *sdkMember) http(t *testing.T, addr, service, path string) sdkHTTPResult {
+	t.Helper()
+	res := m.httpRaw(t, addr, service, path)
 	if !res.OK {
 		t.Fatalf("%s member could not call %s%s at %s: %s", m.name, service, path, addr, res.Error)
 	}
@@ -1160,18 +1371,30 @@ func (m *sdkMember) http(t *testing.T, addr, service, path string) sdkHTTPResult
 // routers asks the member which routers admitted it so far.
 func (m *sdkMember) routers(t *testing.T) []string {
 	t.Helper()
-	var res struct {
-		OK      bool     `json:"ok"`
-		Error   string   `json:"error"`
-		Routers []string `json:"routers"`
-	}
+	return m.routersAnswer(t).Routers
+}
+
+// relayAddresses are the `.../p2p-circuit/p2p/<member>` addresses the member
+// holds a reservation for right now.
+func (m *sdkMember) relayAddresses(t *testing.T) []string {
+	t.Helper()
+	return m.routersAnswer(t).RelayAddresses
+}
+
+func (m *sdkMember) routersAnswer(t *testing.T) (res struct {
+	OK             bool     `json:"ok"`
+	Error          string   `json:"error"`
+	Routers        []string `json:"routers"`
+	RelayAddresses []string `json:"relay_addresses"`
+}) {
+	t.Helper()
 	if line := m.send(t, map[string]string{"cmd": "routers"}); json.Unmarshal(line, &res) != nil {
 		t.Fatalf("%s member: routers answered %q", m.name, line)
 	}
 	if !res.OK {
 		t.Fatalf("%s member: routers: %s", m.name, res.Error)
 	}
-	return res.Routers
+	return res
 }
 
 func (m *sdkMember) quit(t *testing.T) {
@@ -1440,6 +1663,38 @@ func refuseForgedFrame(t *testing.T, ctx context.Context, h host.Host, target pe
 	if msg, err := msgio.NewVarintReaderSize(s, 64*1024).ReadMsg(); err == nil {
 		t.Fatalf("%s answered a forged frame with %d bytes", target, len(msg))
 	}
+}
+
+// startStalledRelay is a circuit relay that answers every CONNECT with OK and
+// forwards nothing: what a caller sees when the relay's destination accepted
+// the circuit but never completes its side of the handshake. It speaks no
+// other protocol, so no member admits it as a router; a caller reaches it
+// only by an explicit /p2p-circuit address. Returns its address and the
+// count of circuits the callers let go of, by resetting or closing them.
+func startStalledRelay(t *testing.T) (string, *atomic.Int32) {
+	t.Helper()
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("failed to create the stalled relay: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	released := new(atomic.Int32)
+	h.SetStreamHandler(circuitproto.ProtoIDv2Hop, func(s network.Stream) {
+		defer func() { _ = s.Close() }()
+		var msg circuitpb.HopMessage
+		if err := circuitutil.NewDelimitedReader(s, 4096).ReadMsg(&msg); err != nil || msg.GetType() != circuitpb.HopMessage_CONNECT {
+			return
+		}
+		ok := circuitpb.HopMessage{Type: circuitpb.HopMessage_STATUS.Enum(), Status: circuitpb.Status_OK.Enum()}
+		if err := circuitutil.NewDelimitedWriter(s).WriteMsg(&ok); err != nil {
+			return
+		}
+		// The caller's handshake bytes arrive and nothing answers them; the
+		// read ends when the caller resets or closes the circuit.
+		_, _ = io.Copy(io.Discard, s)
+		released.Add(1)
+	})
+	return h.Addrs()[0].String() + "/p2p/" + h.ID().String(), released
 }
 
 // pickDirectAddr is the member's loopback TCP address with its peer ID.
