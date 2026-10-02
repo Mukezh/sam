@@ -24,7 +24,6 @@ import (
 
 	"github.com/google/sam/api"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func TestHandleDiscoverRemoteServices(t *testing.T) {
@@ -184,11 +183,11 @@ func TestDebugHandlerHTTP(t *testing.T) {
 	if strings.Contains(networkInfo.Body.String(), `"observed_addresses"`) {
 		t.Fatalf("network info response still contains observed_addresses: %s", networkInfo.Body.String())
 	}
-	var networkInfoResponse api.NetworkInfoResponse
-	if err := protojson.Unmarshal(networkInfo.Body.Bytes(), &networkInfoResponse); err != nil {
+	var info networkInfoResponse
+	if err := json.Unmarshal(networkInfo.Body.Bytes(), &info); err != nil {
 		t.Fatalf("decode network info response: %v", err)
 	}
-	if len(networkInfoResponse.AnnouncedAddresses) == 0 {
+	if len(info.AnnouncedAddresses) == 0 {
 		t.Fatalf("network info response has no announced_addresses: %s", networkInfo.Body.String())
 	}
 

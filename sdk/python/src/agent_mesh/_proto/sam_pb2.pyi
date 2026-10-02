@@ -376,14 +376,6 @@ class MeshEvent(_message.Message):
     type: MeshEvent.Type
     def __init__(self, type: _Optional[_Union[MeshEvent.Type, str]] = ..., peer_id: _Optional[str] = ..., event_time: _Optional[_Union[_timestamp_pb2.Timestamp, _Mapping]] = ..., new_public_key: _Optional[bytes] = ..., signature: _Optional[bytes] = ...) -> None: ...
 
-class NetworkInfoResponse(_message.Message):
-    __slots__ = ["announced_addresses", "listen_addresses"]
-    ANNOUNCED_ADDRESSES_FIELD_NUMBER: _ClassVar[int]
-    LISTEN_ADDRESSES_FIELD_NUMBER: _ClassVar[int]
-    announced_addresses: _containers.RepeatedScalarFieldContainer[str]
-    listen_addresses: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, listen_addresses: _Optional[_Iterable[str]] = ..., announced_addresses: _Optional[_Iterable[str]] = ...) -> None: ...
-
 class NodeCatalogReport(_message.Message):
     __slots__ = ["services"]
     SERVICES_FIELD_NUMBER: _ClassVar[int]

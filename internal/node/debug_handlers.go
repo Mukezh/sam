@@ -21,11 +21,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/sam/api"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
 )
 
 // Bound the diagnostic dials so a dead peer yields an error instead of a
@@ -51,7 +48,7 @@ func newDebugHandler(n *SamNode) http.Handler {
 		writeDebugJSON(w, n.connectivityStats(r.Context(), r.URL.Query().Get("peer_id")))
 	})
 	mux.HandleFunc("GET /debug/network-info", func(w http.ResponseWriter, r *http.Request) {
-		writeDebugProtoJSON(w, n.networkInfo())
+		writeDebugJSON(w, n.networkInfo())
 	})
 	mux.HandleFunc("GET /debug/token-info", func(w http.ResponseWriter, r *http.Request) {
 		writeDebugJSON(w, n.tokenInfo())
@@ -112,19 +109,6 @@ func writeDebugJSON(w http.ResponseWriter, v any) {
 	}
 }
 
-func writeDebugProtoJSON(w http.ResponseWriter, value proto.Message) {
-	data, err := (protojson.MarshalOptions{UseProtoNames: true}).Marshal(value)
-	if err != nil {
-		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-		logger.Errorf("Failed to encode response: %v", err)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if _, err := w.Write(append(data, '\n')); err != nil {
-		logger.Errorf("Failed to write response: %v", err)
-	}
-}
-
 // The types below are the /debug payloads. They are unexported on purpose:
 // these endpoints are unversioned operator diagnostics, not part of the
 // api/sam.proto mesh contract.
@@ -152,6 +136,11 @@ type tokenInfoResponse struct {
 	HasToken         bool     `json:"has_token"`
 	ExpiresInSeconds *float64 `json:"expires_in_seconds,omitempty"`
 	IsExpired        *bool    `json:"is_expired,omitempty"`
+}
+
+type networkInfoResponse struct {
+	ListenAddresses    []string `json:"listen_addresses"`
+	AnnouncedAddresses []string `json:"announced_addresses"`
 }
 
 type logsResponse struct {
@@ -243,7 +232,7 @@ func (n *SamNode) tokenInfo() tokenInfoResponse {
 }
 
 // networkInfo backs GET /debug/network-info.
-func (n *SamNode) networkInfo() *api.NetworkInfoResponse {
+func (n *SamNode) networkInfo() networkInfoResponse {
 	listenAddrs := []string{}
 	for _, a := range n.Host.Network().ListenAddresses() {
 		listenAddrs = append(listenAddrs, a.String())
@@ -254,7 +243,7 @@ func (n *SamNode) networkInfo() *api.NetworkInfoResponse {
 		announcedAddrs = append(announcedAddrs, a.String())
 	}
 
-	return &api.NetworkInfoResponse{
+	return networkInfoResponse{
 		ListenAddresses:    listenAddrs,
 		AnnouncedAddresses: announcedAddrs,
 	}

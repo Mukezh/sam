@@ -3520,58 +3520,6 @@ func (x *OIDCSession) GetRefreshToken() string {
 	return ""
 }
 
-type NetworkInfoResponse struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	ListenAddresses    []string               `protobuf:"bytes,1,rep,name=listen_addresses,json=listenAddresses,proto3" json:"listen_addresses,omitempty"`
-	AnnouncedAddresses []string               `protobuf:"bytes,2,rep,name=announced_addresses,json=announcedAddresses,proto3" json:"announced_addresses,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
-}
-
-func (x *NetworkInfoResponse) Reset() {
-	*x = NetworkInfoResponse{}
-	mi := &file_api_sam_proto_msgTypes[49]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *NetworkInfoResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*NetworkInfoResponse) ProtoMessage() {}
-
-func (x *NetworkInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_sam_proto_msgTypes[49]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use NetworkInfoResponse.ProtoReflect.Descriptor instead.
-func (*NetworkInfoResponse) Descriptor() ([]byte, []int) {
-	return file_api_sam_proto_rawDescGZIP(), []int{49}
-}
-
-func (x *NetworkInfoResponse) GetListenAddresses() []string {
-	if x != nil {
-		return x.ListenAddresses
-	}
-	return nil
-}
-
-func (x *NetworkInfoResponse) GetAnnouncedAddresses() []string {
-	if x != nil {
-		return x.AnnouncedAddresses
-	}
-	return nil
-}
-
 var File_api_sam_proto protoreflect.FileDescriptor
 
 const file_api_sam_proto_rawDesc = "" +
@@ -3841,10 +3789,7 @@ const file_api_sam_proto_rawDesc = "" +
 	"\x06issuer\x18\x01 \x01(\tR\x06issuer\x12\x1b\n" +
 	"\tclient_id\x18\x02 \x01(\tR\bclientId\x12\x1a\n" +
 	"\baudience\x18\x03 \x01(\tR\baudience\x12#\n" +
-	"\rrefresh_token\x18\x04 \x01(\tR\frefreshToken\"q\n" +
-	"\x13NetworkInfoResponse\x12)\n" +
-	"\x10listen_addresses\x18\x01 \x03(\tR\x0flistenAddresses\x12/\n" +
-	"\x13announced_addresses\x18\x02 \x03(\tR\x12announcedAddresses*\x94\x01\n" +
+	"\rrefresh_token\x18\x04 \x01(\tR\frefreshToken*\x94\x01\n" +
 	"\x10EnrollmentStatus\x12!\n" +
 	"\x1dENROLLMENT_STATUS_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19ENROLLMENT_STATUS_PENDING\x10\x01\x12\x1e\n" +
@@ -3870,7 +3815,7 @@ func file_api_sam_proto_rawDescGZIP() []byte {
 }
 
 var file_api_sam_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_api_sam_proto_msgTypes = make([]protoimpl.MessageInfo, 55)
+var file_api_sam_proto_msgTypes = make([]protoimpl.MessageInfo, 54)
 var file_api_sam_proto_goTypes = []any{
 	(EnrollmentStatus)(0),              // 0: sam.v1.EnrollmentStatus
 	(ServiceType)(0),                   // 1: sam.v1.ServiceType
@@ -3924,56 +3869,55 @@ var file_api_sam_proto_goTypes = []any{
 	(*MemberCredential)(nil),           // 49: sam.v1.MemberCredential
 	(*TrustedSigningKey)(nil),          // 50: sam.v1.TrustedSigningKey
 	(*OIDCSession)(nil),                // 51: sam.v1.OIDCSession
-	(*NetworkInfoResponse)(nil),        // 52: sam.v1.NetworkInfoResponse
-	nil,                                // 53: sam.v1.EnrollRequest.LabelsEntry
-	nil,                                // 54: sam.v1.BootstrapEnrollRequest.LabelsEntry
-	nil,                                // 55: sam.v1.CommandBackend.EnvEntry
-	nil,                                // 56: sam.v1.ServiceAnnounce.LabelsEntry
-	nil,                                // 57: sam.v1.PeerEvidenceResponse.LabelsEntry
-	(*timestamppb.Timestamp)(nil),      // 58: google.protobuf.Timestamp
+	nil,                                // 52: sam.v1.EnrollRequest.LabelsEntry
+	nil,                                // 53: sam.v1.BootstrapEnrollRequest.LabelsEntry
+	nil,                                // 54: sam.v1.CommandBackend.EnvEntry
+	nil,                                // 55: sam.v1.ServiceAnnounce.LabelsEntry
+	nil,                                // 56: sam.v1.PeerEvidenceResponse.LabelsEntry
+	(*timestamppb.Timestamp)(nil),      // 57: google.protobuf.Timestamp
 }
 var file_api_sam_proto_depIdxs = []int32{
 	2,  // 0: sam.v1.MeshEvent.type:type_name -> sam.v1.MeshEvent.Type
-	58, // 1: sam.v1.MeshEvent.event_time:type_name -> google.protobuf.Timestamp
-	53, // 2: sam.v1.EnrollRequest.labels:type_name -> sam.v1.EnrollRequest.LabelsEntry
-	58, // 3: sam.v1.EnrollResponse.expire_time:type_name -> google.protobuf.Timestamp
-	54, // 4: sam.v1.BootstrapEnrollRequest.labels:type_name -> sam.v1.BootstrapEnrollRequest.LabelsEntry
+	57, // 1: sam.v1.MeshEvent.event_time:type_name -> google.protobuf.Timestamp
+	52, // 2: sam.v1.EnrollRequest.labels:type_name -> sam.v1.EnrollRequest.LabelsEntry
+	57, // 3: sam.v1.EnrollResponse.expire_time:type_name -> google.protobuf.Timestamp
+	53, // 4: sam.v1.BootstrapEnrollRequest.labels:type_name -> sam.v1.BootstrapEnrollRequest.LabelsEntry
 	0,  // 5: sam.v1.BootstrapEnrollResponse.status:type_name -> sam.v1.EnrollmentStatus
-	58, // 6: sam.v1.BootstrapEnrollResponse.expire_time:type_name -> google.protobuf.Timestamp
+	57, // 6: sam.v1.BootstrapEnrollResponse.expire_time:type_name -> google.protobuf.Timestamp
 	1,  // 7: sam.v1.ServiceInfo.type:type_name -> sam.v1.ServiceType
-	55, // 8: sam.v1.CommandBackend.env:type_name -> sam.v1.CommandBackend.EnvEntry
+	54, // 8: sam.v1.CommandBackend.env:type_name -> sam.v1.CommandBackend.EnvEntry
 	10, // 9: sam.v1.RegisterServiceRequest.service:type_name -> sam.v1.ServiceInfo
 	11, // 10: sam.v1.RegisterServiceRequest.command:type_name -> sam.v1.CommandBackend
 	1,  // 11: sam.v1.ServiceAnnounce.type:type_name -> sam.v1.ServiceType
-	56, // 12: sam.v1.ServiceAnnounce.labels:type_name -> sam.v1.ServiceAnnounce.LabelsEntry
-	58, // 13: sam.v1.ServiceAnnounce.announce_time:type_name -> google.protobuf.Timestamp
-	58, // 14: sam.v1.RouterLeaseResponse.expire_time:type_name -> google.protobuf.Timestamp
+	55, // 12: sam.v1.ServiceAnnounce.labels:type_name -> sam.v1.ServiceAnnounce.LabelsEntry
+	57, // 13: sam.v1.ServiceAnnounce.announce_time:type_name -> google.protobuf.Timestamp
+	57, // 14: sam.v1.RouterLeaseResponse.expire_time:type_name -> google.protobuf.Timestamp
 	19, // 15: sam.v1.PolicyRole.http:type_name -> sam.v1.HTTPGrant
 	18, // 16: sam.v1.PolicyConfig.roles:type_name -> sam.v1.PolicyRole
 	21, // 17: sam.v1.PolicyConfig.bindings:type_name -> sam.v1.PolicyBinding
 	20, // 18: sam.v1.PolicyConfig.egress:type_name -> sam.v1.EgressDestination
 	20, // 19: sam.v1.EgressAssignmentsResponse.egress:type_name -> sam.v1.EgressDestination
-	58, // 20: sam.v1.KeysResponse.sign_time:type_name -> google.protobuf.Timestamp
-	58, // 21: sam.v1.TokenRefreshResponse.expire_time:type_name -> google.protobuf.Timestamp
+	57, // 20: sam.v1.KeysResponse.sign_time:type_name -> google.protobuf.Timestamp
+	57, // 21: sam.v1.TokenRefreshResponse.expire_time:type_name -> google.protobuf.Timestamp
 	10, // 22: sam.v1.NodeCatalogReport.services:type_name -> sam.v1.ServiceInfo
 	34, // 23: sam.v1.AgentEgress.secrets:type_name -> sam.v1.AgentSecret
 	1,  // 24: sam.v1.AgentIngress.type:type_name -> sam.v1.ServiceType
 	35, // 25: sam.v1.AgentBundle.egress:type_name -> sam.v1.AgentEgress
 	36, // 26: sam.v1.AgentBundle.ingress:type_name -> sam.v1.AgentIngress
 	37, // 27: sam.v1.AgentAttachRequest.bundle:type_name -> sam.v1.AgentBundle
-	58, // 28: sam.v1.AgentRefreshResponse.expire_time:type_name -> google.protobuf.Timestamp
+	57, // 28: sam.v1.AgentRefreshResponse.expire_time:type_name -> google.protobuf.Timestamp
 	36, // 29: sam.v1.AgentStatus.ingress:type_name -> sam.v1.AgentIngress
-	58, // 30: sam.v1.AgentStatus.credential_expire_time:type_name -> google.protobuf.Timestamp
+	57, // 30: sam.v1.AgentStatus.credential_expire_time:type_name -> google.protobuf.Timestamp
 	45, // 31: sam.v1.AgentStatusResponse.agents:type_name -> sam.v1.AgentStatus
-	58, // 32: sam.v1.IdentityEvidenceResponse.biscuit_expire_time:type_name -> google.protobuf.Timestamp
-	58, // 33: sam.v1.IdentityEvidenceResponse.check_time:type_name -> google.protobuf.Timestamp
-	57, // 34: sam.v1.PeerEvidenceResponse.labels:type_name -> sam.v1.PeerEvidenceResponse.LabelsEntry
-	58, // 35: sam.v1.PeerEvidenceResponse.expire_time:type_name -> google.protobuf.Timestamp
-	58, // 36: sam.v1.PeerEvidenceResponse.check_time:type_name -> google.protobuf.Timestamp
-	58, // 37: sam.v1.MemberCredential.expire_time:type_name -> google.protobuf.Timestamp
+	57, // 32: sam.v1.IdentityEvidenceResponse.biscuit_expire_time:type_name -> google.protobuf.Timestamp
+	57, // 33: sam.v1.IdentityEvidenceResponse.check_time:type_name -> google.protobuf.Timestamp
+	56, // 34: sam.v1.PeerEvidenceResponse.labels:type_name -> sam.v1.PeerEvidenceResponse.LabelsEntry
+	57, // 35: sam.v1.PeerEvidenceResponse.expire_time:type_name -> google.protobuf.Timestamp
+	57, // 36: sam.v1.PeerEvidenceResponse.check_time:type_name -> google.protobuf.Timestamp
+	57, // 37: sam.v1.MemberCredential.expire_time:type_name -> google.protobuf.Timestamp
 	50, // 38: sam.v1.MemberCredential.trusted_keys:type_name -> sam.v1.TrustedSigningKey
 	51, // 39: sam.v1.MemberCredential.oidc_session:type_name -> sam.v1.OIDCSession
-	58, // 40: sam.v1.TrustedSigningKey.receive_time:type_name -> google.protobuf.Timestamp
+	57, // 40: sam.v1.TrustedSigningKey.receive_time:type_name -> google.protobuf.Timestamp
 	41, // [41:41] is the sub-list for method output_type
 	41, // [41:41] is the sub-list for method input_type
 	41, // [41:41] is the sub-list for extension type_name
@@ -3996,7 +3940,7 @@ func file_api_sam_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_sam_proto_rawDesc), len(file_api_sam_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   55,
+			NumMessages:   54,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
